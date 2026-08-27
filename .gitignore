@@ -1,0 +1,13 @@
+/target
+
+.env
+.postgres.env
+
+data/
+*.session
+*.session-journal
+.tcloud-cloud-secrets.local
+*.session-wal
+*.session-shm
+.env.*
+target/

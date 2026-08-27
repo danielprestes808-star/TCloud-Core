@@ -1,0 +1,12 @@
+target
+.git
+.env
+.env.*
+!.env.example
+data
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+logs
+.tcloud-cloud-secrets.local
