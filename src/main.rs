@@ -962,11 +962,23 @@ fn decrypt_telegram_session(packed: &[u8]) -> Option<Vec<u8>> {
 }
 
 async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
+    // TCLOUD_CLOUD_FRESH_SESSION_BOOT_100
+    // Render usa filesystem efemero, mas uma instancia nova ainda pode iniciar com
+    // um arquivo de sessao presente no runtime. Em cloud, o PostgreSQL e a fonte
+    // canonica: se houver snapshot remoto, ele sempre sobrescreve o arquivo local;
+    // se nao houver, qualquer sessao local residual e removida para que o login
+    // crie uma auth key realmente nova e independente.
+    let cloud_runtime = env::var("PORT").is_ok();
+
     let local_exists = std::fs::metadata(session_path)
         .map(|metadata| metadata.len() > 0)
         .unwrap_or(false);
 
-    if local_exists || telegram_session_cipher().is_none() {
+    if telegram_session_cipher().is_none() {
+        return;
+    }
+
+    if !cloud_runtime && local_exists {
         return;
     }
 
@@ -991,6 +1003,28 @@ async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
     };
 
     let Some(row) = row else {
+        if cloud_runtime {
+            let session_files = [
+                session_path.to_string(),
+                format!("{session_path}-journal"),
+                format!("{session_path}-wal"),
+                format!("{session_path}-shm"),
+            ];
+
+            for path in session_files {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        println!("Sessao Telegram residual removida do runtime cloud: {path}")
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        eprintln!("Falha ao remover sessao Telegram residual {path}: {error}")
+                    }
+                }
+            }
+
+            println!("Nenhuma sessao Telegram remota encontrada; runtime cloud iniciara limpo.");
+        }
         return;
     };
 
@@ -1009,6 +1043,12 @@ async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
 
     if let Some(parent) = PathBuf::from(session_path).parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+
+    if cloud_runtime {
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{session_path}{suffix}"));
+        }
     }
 
     match std::fs::write(session_path, payload) {
