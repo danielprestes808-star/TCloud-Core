@@ -10,4 +10,5 @@ data/
 *.session-wal
 *.session-shm
 .env.*
+!.env.example
 target/

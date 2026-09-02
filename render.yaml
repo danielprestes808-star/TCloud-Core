@@ -4,9 +4,11 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /health
-    autoDeploy: true
+    autoDeployTrigger: commit
     envVars:
       - key: TCLOUD_DATABASE_URL
+        sync: false
+      - key: TCLOUD_API_TOKEN
         sync: false
       - key: TCLOUD_TELEGRAM_API_ID
         sync: false

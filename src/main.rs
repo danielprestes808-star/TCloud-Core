@@ -1,8 +1,9 @@
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware,
     response::Response,
     routing::{get, post},
 };
@@ -11,6 +12,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use grammers_client::grammers_tl_types as tl;
 use grammers_client::{
     Client, InputMessage, SignInError,
@@ -24,15 +26,17 @@ use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    io::Cursor,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::Mutex;
+use tokio_util::io::StreamReader;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
+
+mod security;
 
 const LOCAL_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
@@ -579,16 +583,16 @@ async fn get_media(
     let mut start = 0u64;
     let mut requested_end = total.saturating_sub(1);
 
-    if let Some(spec) = range_header.and_then(|value| value.strip_prefix("bytes=")) {
-        if let Some((left, right)) = spec.split_once('-') {
-            if let Ok(value) = left.trim().parse::<u64>() {
-                start = value.min(total.saturating_sub(1));
-            }
-            if !right.trim().is_empty() {
-                if let Ok(value) = right.trim().parse::<u64>() {
-                    requested_end = value.min(total.saturating_sub(1));
-                }
-            }
+    if let Some(spec) = range_header.and_then(|value| value.strip_prefix("bytes="))
+        && let Some((left, right)) = spec.split_once('-')
+    {
+        if let Ok(value) = left.trim().parse::<u64>() {
+            start = value.min(total.saturating_sub(1));
+        }
+        if !right.trim().is_empty()
+            && let Ok(value) = right.trim().parse::<u64>()
+        {
+            requested_end = value.min(total.saturating_sub(1));
         }
     }
 
@@ -689,6 +693,8 @@ async fn main() {
             "127.0.0.1".to_string()
         }
     });
+    let security = security::SecurityState::from_environment(render_port.is_some())
+        .expect("configuracao de seguranca do TCloud Core invalida");
 
     let db = connect_database().await;
     let telegram = initialize_telegram(db.as_ref()).await;
@@ -725,10 +731,10 @@ async fn main() {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            if let Ok(header) = origin.parse::<HeaderValue>() {
-                if !allowed_origins.contains(&header) {
-                    allowed_origins.push(header);
-                }
+            if let Ok(header) = origin.parse::<HeaderValue>()
+                && !allowed_origins.contains(&header)
+            {
+                allowed_origins.push(header);
             }
         }
     }
@@ -744,8 +750,7 @@ async fn main() {
             header::CONTENT_TYPE,
         ]);
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let protected_api = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/platform/capabilities", get(platform_capabilities))
         .route("/api/v1/files", get(list_files))
@@ -773,9 +778,14 @@ async fn main() {
         .route("/api/v1/index/status", get(index_status))
         .route("/api/v1/live/revision", get(live_revision))
         .route("/api/v1/dialogs", get(list_dialogs))
+        .layer(middleware::from_fn_with_state(security, security::protect));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected_api)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state.clone());
 
     // TCLOUD_SYNC_INTEGRITY_611_AUTO_DELTA
@@ -1677,8 +1687,7 @@ async fn fetch_forum_topics(
             .await
             .map_err(|error| error.to_string())?;
 
-        let forum_topics = tl::types::messages::ForumTopics::try_from(response)
-            .map_err(|_| "Telegram retornou forumTopics em formato inesperado".to_string())?;
+        let forum_topics: tl::types::messages::ForumTopics = response.into();
 
         let expected_total = forum_topics.count.max(0) as usize;
         let before = seen.len();
@@ -1988,7 +1997,7 @@ async fn index_telegram_content(
 
     let included_names = env::var("TCLOUD_INDEX_INCLUDED_DIALOGS")
         .unwrap_or_else(|_| "Meus Arquivos".to_string())
-        .split(|value| value == ';' || value == ',')
+        .split([';', ','])
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
@@ -2453,16 +2462,16 @@ async fn index_telegram_content(
 
                     if display_name.trim().is_empty() {
                         display_name = fallback_file_name(message_id, &mime, telegram_video);
-                    } else if std::path::Path::new(&display_name).extension().is_none() {
-                        if let Some(ext) = original_ext.as_deref() {
-                            display_name.push('.');
-                            display_name.push_str(ext);
-                        }
+                    } else if std::path::Path::new(&display_name).extension().is_none()
+                        && let Some(ext) = original_ext.as_deref()
+                    {
+                        display_name.push('.');
+                        display_name.push_str(ext);
                     }
 
                     let kind = classify_file_kind(&display_name, &mime);
 
-                    (display_name, kind, document.size() as i64, mime)
+                    (display_name, kind, document.size(), mime)
                 }
                 Media::Photo(_) => (
                     format!("imagem_{message_id}.jpg"),
@@ -2773,8 +2782,8 @@ async fn index_status(State(state): State<AppState>) -> Json<IndexStatus> {
     let mut messages_seen = 0_i64;
     let mut files_upserted = 0_i64;
 
-    if let Some(pool) = &state.db {
-        if let Ok(Some(row)) = sqlx_core::query::query::<Postgres>(
+    if let Some(pool) = &state.db
+        && let Ok(Some(row)) = sqlx_core::query::query::<Postgres>(
             r#"
                 SELECT
                     id::text AS id,
@@ -2791,14 +2800,13 @@ async fn index_status(State(state): State<AppState>) -> Json<IndexStatus> {
         )
         .fetch_optional(pool)
         .await
-        {
-            last_run_id = row.try_get("id").ok();
-            last_status = row.try_get("status").ok();
-            dialogs_seen = row.try_get("dialogs_seen").unwrap_or_default();
-            topics_seen = row.try_get("topics_seen").unwrap_or_default();
-            messages_seen = row.try_get("messages_seen").unwrap_or_default();
-            files_upserted = row.try_get("files_upserted").unwrap_or_default();
-        }
+    {
+        last_run_id = row.try_get("id").ok();
+        last_status = row.try_get("status").ok();
+        dialogs_seen = row.try_get("dialogs_seen").unwrap_or_default();
+        topics_seen = row.try_get("topics_seen").unwrap_or_default();
+        messages_seen = row.try_get("messages_seen").unwrap_or_default();
+        files_upserted = row.try_get("files_upserted").unwrap_or_default();
     }
 
     Json(IndexStatus {
@@ -3671,11 +3679,11 @@ async fn create_folder(
                 }
             };
 
-            if let Some(tl::enums::MessageAction::TopicCreate(action)) = message.action() {
-                if action.title.trim().eq_ignore_ascii_case(&clean_name) {
-                    topic_id = Some(message.id());
-                    break;
-                }
+            if let Some(tl::enums::MessageAction::TopicCreate(action)) = message.action()
+                && action.title.trim().eq_ignore_ascii_case(&clean_name)
+            {
+                topic_id = Some(message.id());
+                break;
             }
         }
 
@@ -3753,21 +3761,32 @@ async fn create_folder(
 async fn upload_file(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
-    const MAX_WEB_UPLOAD: usize = 512 * 1024 * 1024;
+    const MAX_WEB_UPLOAD: usize = 64 * 1024 * 1024;
 
-    if body.is_empty() {
+    let body_len = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            mutation_error(
+                StatusCode::LENGTH_REQUIRED,
+                "Envie o tamanho do arquivo no cabecalho Content-Length.",
+            )
+        })?;
+
+    if body_len == 0 {
         return Err(mutation_error(
             StatusCode::BAD_REQUEST,
             "O arquivo está vazio.",
         ));
     }
 
-    if body.len() > MAX_WEB_UPLOAD {
+    if body_len > MAX_WEB_UPLOAD {
         return Err(mutation_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "Nesta etapa, o envio Web aceita até 512 MB por arquivo.",
+            "O envio Web aceita até 64 MB por arquivo.",
         ));
     }
 
@@ -3776,6 +3795,15 @@ async fn upload_file(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .trim();
+
+    let recovery_id = headers
+        .get("x-tcloud-recover-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "Arquivo de recuperação inválido."))?;
 
     let encoded_name = headers
         .get("x-tcloud-file-name")
@@ -3786,8 +3814,14 @@ async fn upload_file(
     let file_name = clean_mutation_name(&percent_decode_header(encoded_name))
         .map_err(|message| mutation_error(StatusCode::BAD_REQUEST, message))?;
 
-    let parent_uuid = Uuid::parse_str(parent_text)
-        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "Destino do upload inválido."))?;
+    let requested_parent_uuid =
+        if recovery_id.is_none() {
+            Some(Uuid::parse_str(parent_text).map_err(|_| {
+                mutation_error(StatusCode::BAD_REQUEST, "Destino do upload inválido.")
+            })?)
+        } else {
+            None
+        };
 
     let mime = headers
         .get("content-type")
@@ -3811,46 +3845,90 @@ async fn upload_file(
         ));
     };
 
-    let destination = sqlx_core::query::query::<Postgres>(
-        r#"
-        SELECT
-            telegram_peer_id,
-            telegram_topic_id
-        FROM telegram_index_folders
-        WHERE id = $1
-          AND deleted_at IS NULL
-        LIMIT 1
-        "#,
-    )
-    .bind(parent_uuid)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (parent_uuid, peer_id, topic_id) = if let Some(file_uuid) = recovery_id {
+        let file = sqlx_core::query::query::<Postgres>(
+            r#"
+            SELECT parent_id, telegram_peer_id, telegram_topic_id, name, size_bytes
+            FROM telegram_index_files
+            WHERE id = $1
+              AND deleted_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(file_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let Some(destination) = destination else {
-        return Err(mutation_error(
-            StatusCode::NOT_FOUND,
-            "Destino do upload não encontrado.",
-        ));
+        let Some(file) = file else {
+            return Err(mutation_error(
+                StatusCode::NOT_FOUND,
+                "Arquivo de recuperação não encontrado.",
+            ));
+        };
+
+        let expected_name = file.try_get::<String, _>("name").unwrap_or_default();
+        let expected_size = file.try_get::<i64, _>("size_bytes").unwrap_or_default();
+        if expected_name != file_name || expected_size != body_len as i64 {
+            return Err(mutation_error(
+                StatusCode::CONFLICT,
+                "A cópia local não corresponde ao nome e tamanho registrados.",
+            ));
+        }
+
+        (
+            file.try_get::<Uuid, _>("parent_id").map_err(|_| {
+                mutation_error(StatusCode::CONFLICT, "Arquivo sem pasta de recuperação.")
+            })?,
+            file.try_get::<i64, _>("telegram_peer_id")
+                .unwrap_or_default(),
+            file.try_get::<i64, _>("telegram_topic_id")
+                .unwrap_or_default(),
+        )
+    } else {
+        let parent_uuid = requested_parent_uuid.expect("parent id checked for regular upload");
+        let destination = sqlx_core::query::query::<Postgres>(
+            r#"
+            SELECT telegram_peer_id, telegram_topic_id
+            FROM telegram_index_folders
+            WHERE id = $1
+              AND deleted_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(parent_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+        let Some(destination) = destination else {
+            return Err(mutation_error(
+                StatusCode::NOT_FOUND,
+                "Destino do upload não encontrado.",
+            ));
+        };
+
+        (
+            parent_uuid,
+            destination
+                .try_get::<i64, _>("telegram_peer_id")
+                .unwrap_or_default(),
+            destination
+                .try_get::<i64, _>("telegram_topic_id")
+                .unwrap_or_default(),
+        )
     };
-
-    let peer_id = destination
-        .try_get::<i64, _>("telegram_peer_id")
-        .unwrap_or_default();
-
-    let topic_id = destination
-        .try_get::<i64, _>("telegram_topic_id")
-        .unwrap_or_default();
 
     let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
-    let mut cursor = Cursor::new(body.to_vec());
+    let stream = body.into_data_stream().map_err(std::io::Error::other);
+    let mut reader = StreamReader::new(stream);
 
     let uploaded = telegram
         .client
-        .upload_stream(&mut cursor, body.len(), file_name.clone())
+        .upload_stream(&mut reader, body_len, file_name.clone())
         .await
         .map_err(|error| {
             mutation_error(
@@ -3886,8 +3964,40 @@ async fn upload_file(
     let kind = classify_file_kind(&file_name, &mime);
     let file_id = Uuid::new_v4();
 
-    let saved_id = sqlx_core::query_scalar::query_scalar::<Postgres, Uuid>(
-        r#"
+    let saved_id = if let Some(file_uuid) = recovery_id {
+        sqlx_core::query_scalar::query_scalar::<Postgres, Uuid>(
+            r#"
+            UPDATE telegram_index_files
+            SET
+                telegram_peer_id = $2,
+                telegram_topic_id = $3,
+                telegram_message_id = $4,
+                size_bytes = $5,
+                mime = $6,
+                sync_state = 'online',
+                source = 'recovery-upload',
+                message_date = $7,
+                manual_trash = FALSE,
+                deleted_at = NULL,
+                trashed_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id
+            "#,
+        )
+        .bind(file_uuid)
+        .bind(peer_id)
+        .bind(topic_id)
+        .bind(i64::from(sent.id()))
+        .bind(body_len as i64)
+        .bind(&mime)
+        .bind(sent.date())
+        .fetch_one(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    } else {
+        sqlx_core::query_scalar::query_scalar::<Postgres, Uuid>(
+            r#"
             INSERT INTO telegram_index_files (
                 id,
                 user_id,
@@ -3945,24 +4055,29 @@ async fn upload_file(
                 updated_at = NOW()
             RETURNING id
             "#,
-    )
-    .bind(file_id)
-    .bind(local_user_uuid())
-    .bind(parent_uuid)
-    .bind(peer_id)
-    .bind(topic_id)
-    .bind(i64::from(sent.id()))
-    .bind(&file_name)
-    .bind(kind)
-    .bind(body.len() as i64)
-    .bind(&mime)
-    .bind(sent.date())
-    .fetch_one(pool)
-    .await
-    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        )
+        .bind(file_id)
+        .bind(local_user_uuid())
+        .bind(parent_uuid)
+        .bind(peer_id)
+        .bind(topic_id)
+        .bind(i64::from(sent.id()))
+        .bind(&file_name)
+        .bind(kind)
+        .bind(body_len as i64)
+        .bind(&mime)
+        .bind(sent.date())
+        .fetch_one(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    };
 
     Ok(mutation_ok(
-        "Arquivo enviado.",
+        if recovery_id.is_some() {
+            "Arquivo recuperado."
+        } else {
+            "Arquivo enviado."
+        },
         Some(saved_id.to_string()),
         Some(parent_uuid.to_string()),
     ))
@@ -4482,10 +4597,10 @@ async fn list_trash(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
 }
 
 async fn list_files(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
-    if let Some(pool) = &state.db {
-        if let Ok(items) = database_files(pool).await {
-            return Json(items);
-        }
+    if let Some(pool) = &state.db
+        && let Ok(items) = database_files(pool).await
+    {
+        return Json(items);
     }
 
     Json(state.fallback_files.as_ref().clone())
@@ -4495,10 +4610,10 @@ async fn get_file(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TCloudItem>, StatusCode> {
-    if let Some(pool) = &state.db {
-        if let Ok(Some(item)) = database_file(pool, &id).await {
-            return Ok(Json(item));
-        }
+    if let Some(pool) = &state.db
+        && let Ok(Some(item)) = database_file(pool, &id).await
+    {
+        return Ok(Json(item));
     }
 
     state
