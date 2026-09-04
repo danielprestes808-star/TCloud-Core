@@ -1,7 +1,11 @@
+use argon2::{
+    Argon2, PasswordHasher,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware,
     response::Response,
@@ -235,6 +239,67 @@ struct MutationResponse {
     message: String,
     id: Option<String>,
     parent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteMutationRequest {
+    file_id: String,
+    favorite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityItem {
+    id: String,
+    file_id: Option<String>,
+    action: String,
+    detail: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateGroup {
+    signature: String,
+    reclaimable_bytes: i64,
+    files: Vec<TCloudItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageBreakdown {
+    total_bytes: i64,
+    image_bytes: i64,
+    video_bytes: i64,
+    audio_bytes: i64,
+    document_bytes: i64,
+    other_bytes: i64,
+    largest_files: Vec<TCloudItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareLinkRequest {
+    file_id: String,
+    password: Option<String>,
+    expires_in_hours: Option<i64>,
+    max_downloads: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareLinkResponse {
+    id: String,
+    token: String,
+    path: String,
+    expires_at: Option<String>,
+    max_downloads: Option<i32>,
 }
 
 fn mutation_ok(
@@ -754,6 +819,12 @@ async fn main() {
         .route("/api/v1/status", get(status))
         .route("/api/v1/platform/capabilities", get(platform_capabilities))
         .route("/api/v1/files", get(list_files))
+        .route("/api/v1/files/search", get(search_files))
+        .route("/api/v1/favorites", get(list_favorites).post(set_favorite))
+        .route("/api/v1/activity", get(list_activity))
+        .route("/api/v1/duplicates", get(list_duplicates))
+        .route("/api/v1/storage/breakdown", get(storage_breakdown))
+        .route("/api/v1/shares", post(create_share_link))
         .route("/api/v1/files/{id}", get(get_file))
         .route("/api/v1/media/{id}", get(get_media))
         .route("/api/v1/files/upload", post(upload_file))
@@ -861,7 +932,7 @@ async fn main() {
         .await
         .expect("nao foi possivel iniciar o TCloud Core");
 
-    println!("TCloud Core 0.7.0: http://{address}");
+    println!("TCloud Core 0.8.0: http://{address}");
     println!(
         "PostgreSQL:         {}",
         if state.db.is_some() {
@@ -1186,13 +1257,19 @@ struct PlatformCapabilities {
     live_refresh_hint_seconds: u32,
     session_cache: bool,
     max_web_upload_bytes: u64,
+    shared_favorites: bool,
+    activity_feed: bool,
+    global_search: bool,
+    duplicate_analysis: bool,
+    storage_breakdown: bool,
+    protected_share_links: bool,
 }
 
 async fn platform_capabilities() -> Json<PlatformCapabilities> {
     Json(PlatformCapabilities {
         foundation: "5.0",
         api_version: "v1",
-        core_version: "0.7.0",
+        core_version: "0.8.0",
         forum_management: true,
         folder_management: true,
         upload: true,
@@ -1205,6 +1282,12 @@ async fn platform_capabilities() -> Json<PlatformCapabilities> {
         live_refresh_hint_seconds: 8,
         session_cache: true,
         max_web_upload_bytes: 536_870_912,
+        shared_favorites: true,
+        activity_feed: true,
+        global_search: true,
+        duplicate_analysis: true,
+        storage_breakdown: true,
+        protected_share_links: true,
     })
 }
 async fn status(State(state): State<AppState>) -> Json<CoreStatus> {
@@ -1234,7 +1317,7 @@ async fn status(State(state): State<AppState>) -> Json<CoreStatus> {
 
     Json(CoreStatus {
         name: "TCloud Core",
-        version: "0.7.0",
+        version: "0.8.0",
         connected: true,
         telegram_connected,
         telegram_credentials_ready: state.telegram.is_some(),
@@ -4604,6 +4687,227 @@ async fn list_files(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
     }
 
     Json(state.fallback_files.as_ref().clone())
+}
+
+async fn search_files(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Json<Vec<TCloudItem>> {
+    let term = query.q.unwrap_or_default().trim().to_string();
+    if term.is_empty() {
+        return Json(Vec::new());
+    }
+    let Some(pool) = &state.db else {
+        let normalized = term.to_lowercase();
+        return Json(
+            state
+                .fallback_files
+                .iter()
+                .filter(|item| item.name.to_lowercase().contains(&normalized))
+                .take(200)
+                .cloned()
+                .collect(),
+        );
+    };
+    let rows = sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND name ILIKE $2 ORDER BY updated_at DESC LIMIT 200"#)
+        .bind(local_user_uuid()).bind(format!("%{}%", term)).fetch_all(pool).await.unwrap_or_default();
+    Json(rows.into_iter().map(row_to_item).collect())
+}
+
+async fn list_favorites(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
+    let Some(pool) = &state.db else {
+        return Json(Vec::new());
+    };
+    let rows = sqlx_core::query::query::<Postgres>(r#"SELECT f.id::text AS id,f.parent_id::text AS parent_id,f.name,f.kind,f.size_bytes,f.mime,f.sync_state,f.updated_at,f.source FROM tcloud_favorites x JOIN telegram_index_files f ON f.id=x.file_id WHERE x.user_id=$1 AND f.deleted_at IS NULL ORDER BY x.created_at DESC LIMIT 5000"#)
+        .bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+    Json(rows.into_iter().map(row_to_item).collect())
+}
+
+async fn set_favorite(
+    State(state): State<AppState>,
+    Json(request): Json<FavoriteMutationRequest>,
+) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let file_id = Uuid::parse_str(&request.file_id)
+        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de arquivo invalido."))?;
+    if request.favorite {
+        sqlx_core::query::query::<Postgres>(
+            "INSERT INTO tcloud_favorites(user_id,file_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(local_user_uuid())
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    } else {
+        sqlx_core::query::query::<Postgres>(
+            "DELETE FROM tcloud_favorites WHERE user_id=$1 AND file_id=$2",
+        )
+        .bind(local_user_uuid())
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+    record_activity(
+        pool,
+        Some(file_id),
+        if request.favorite {
+            "favorite.add"
+        } else {
+            "favorite.remove"
+        },
+        None,
+    )
+    .await;
+    Ok(mutation_ok(
+        if request.favorite {
+            "Adicionado aos favoritos."
+        } else {
+            "Removido dos favoritos."
+        },
+        Some(file_id.to_string()),
+        None,
+    ))
+}
+
+async fn record_activity(pool: &PgPool, file_id: Option<Uuid>, action: &str, detail: Option<&str>) {
+    let _ = sqlx_core::query::query::<Postgres>(
+        "INSERT INTO tcloud_activity(id,user_id,file_id,action,detail) VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(local_user_uuid())
+    .bind(file_id)
+    .bind(action)
+    .bind(detail)
+    .execute(pool)
+    .await;
+}
+
+async fn list_activity(State(state): State<AppState>) -> Json<Vec<ActivityItem>> {
+    let Some(pool) = &state.db else {
+        return Json(Vec::new());
+    };
+    let rows=sqlx_core::query::query::<Postgres>("SELECT id::text AS id,file_id::text AS file_id,action,detail,created_at FROM tcloud_activity WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500").bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+    Json(
+        rows.into_iter()
+            .map(|row| ActivityItem {
+                id: row.try_get("id").unwrap_or_default(),
+                file_id: row.try_get("file_id").ok(),
+                action: row.try_get("action").unwrap_or_default(),
+                detail: row.try_get("detail").ok(),
+                created_at: row
+                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .map(|v| v.to_rfc3339())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    )
+}
+
+async fn list_duplicates(State(state): State<AppState>) -> Json<Vec<DuplicateGroup>> {
+    let Some(pool) = &state.db else {
+        return Json(Vec::new());
+    };
+    let rows=sqlx_core::query::query::<Postgres>(r#"SELECT lower(name) signature,size_bytes FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND size_bytes>0 GROUP BY lower(name),size_bytes HAVING COUNT(*)>1 ORDER BY size_bytes DESC LIMIT 100"#).bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+    let mut groups = Vec::new();
+    for row in rows {
+        let signature: String = row.try_get("signature").unwrap_or_default();
+        let size: i64 = row.try_get("size_bytes").unwrap_or(0);
+        let files=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND lower(name)=$2 AND size_bytes=$3 ORDER BY updated_at"#).bind(local_user_uuid()).bind(&signature).bind(size).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect::<Vec<_>>();
+        groups.push(DuplicateGroup {
+            signature: format!("{}:{}", signature, size),
+            reclaimable_bytes: size.saturating_mul(files.len().saturating_sub(1) as i64),
+            files,
+        });
+    }
+    Json(groups)
+}
+
+async fn storage_breakdown(State(state): State<AppState>) -> Json<StorageBreakdown> {
+    let Some(pool) = &state.db else {
+        return Json(StorageBreakdown {
+            total_bytes: 0,
+            image_bytes: 0,
+            video_bytes: 0,
+            audio_bytes: 0,
+            document_bytes: 0,
+            other_bytes: 0,
+            largest_files: Vec::new(),
+        });
+    };
+    let row=sqlx_core::query::query::<Postgres>(r#"SELECT COALESCE(SUM(size_bytes),0)::bigint total,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'image/%'),0)::bigint images,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'video/%'),0)::bigint videos,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'audio/%'),0)::bigint audio,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'application/%' OR mime LIKE 'text/%'),0)::bigint documents FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL"#).bind(local_user_uuid()).fetch_one(pool).await.ok();
+    let largest=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL ORDER BY size_bytes DESC LIMIT 50"#).bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect();
+    let total = row
+        .as_ref()
+        .and_then(|r| r.try_get("total").ok())
+        .unwrap_or(0);
+    let images = row
+        .as_ref()
+        .and_then(|r| r.try_get("images").ok())
+        .unwrap_or(0);
+    let videos = row
+        .as_ref()
+        .and_then(|r| r.try_get("videos").ok())
+        .unwrap_or(0);
+    let audio = row
+        .as_ref()
+        .and_then(|r| r.try_get("audio").ok())
+        .unwrap_or(0);
+    let documents = row
+        .as_ref()
+        .and_then(|r| r.try_get("documents").ok())
+        .unwrap_or(0);
+    Json(StorageBreakdown {
+        total_bytes: total,
+        image_bytes: images,
+        video_bytes: videos,
+        audio_bytes: audio,
+        document_bytes: documents,
+        other_bytes: (total - images - videos - audio - documents).max(0),
+        largest_files: largest,
+    })
+}
+
+async fn create_share_link(
+    State(state): State<AppState>,
+    Json(request): Json<ShareLinkRequest>,
+) -> Result<Json<ShareLinkResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let file_id = Uuid::parse_str(&request.file_id)
+        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de arquivo invalido."))?;
+    let id = Uuid::new_v4();
+    let token = Uuid::new_v4();
+    let password_hash = request
+        .password
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(|password| {
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map(|v| v.to_string())
+        })
+        .transpose()
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let expires_at = request
+        .expires_in_hours
+        .filter(|v| *v > 0)
+        .map(|hours| Utc::now() + chrono::Duration::hours(hours.min(24 * 365)));
+    let max_downloads = request.max_downloads.filter(|v| *v > 0);
+    sqlx_core::query::query::<Postgres>("INSERT INTO tcloud_share_links(id,user_id,file_id,token,password_hash,expires_at,max_downloads) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(local_user_uuid()).bind(file_id).bind(token).bind(password_hash).bind(expires_at).bind(max_downloads).execute(pool).await.map_err(|error|mutation_error(StatusCode::BAD_REQUEST,error.to_string()))?;
+    record_activity(pool, Some(file_id), "share.create", Some(&id.to_string())).await;
+    Ok(Json(ShareLinkResponse {
+        id: id.to_string(),
+        token: token.to_string(),
+        path: format!("/share/{}", token),
+        expires_at: expires_at.map(|v| v.to_rfc3339()),
+        max_downloads,
+    }))
 }
 
 async fn get_file(

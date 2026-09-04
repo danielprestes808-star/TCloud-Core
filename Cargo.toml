@@ -1,6 +1,6 @@
 [package]
 name = "tcloud-core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
@@ -22,6 +22,7 @@ chacha20poly1305 = { version = "0.10.1", features = ["std"] }
 hex = "0.4.3"
 constant_time_eq = "0.4.2"
 futures-util = "0.3.32"
+argon2 = "0.5.3"
 
 [patch.crates-io]
 core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e21351e0c69767958efe2a7" }
