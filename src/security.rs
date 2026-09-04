@@ -156,7 +156,21 @@ fn policy_for(path: &str, method: &str, authorized: bool) -> RatePolicy {
             window: Duration::from_secs(300),
         };
     }
-    if method != "GET" {
+    if path.starts_with("/api/v1/media/") && (method == "GET" || method == "HEAD") {
+        return RatePolicy {
+            name: "media-stream",
+            limit: 5_000,
+            window: Duration::from_secs(60),
+        };
+    }
+    if path == "/api/v1/live/revision" && method == "GET" {
+        return RatePolicy {
+            name: "live-revision",
+            limit: 1_200,
+            window: Duration::from_secs(60),
+        };
+    }
+    if method == "POST" {
         return RatePolicy {
             name: "mutation",
             limit: 60,
