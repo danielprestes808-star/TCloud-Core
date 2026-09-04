@@ -7,6 +7,9 @@ use axum::{
 };
 use constant_time_eq::constant_time_eq;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use sqlx_core::query::query;
+use sqlx_postgres::PgPool;
 use std::{
     collections::HashMap,
     env,
@@ -21,6 +24,7 @@ const MAX_BUCKETS: usize = 2_048;
 #[derive(Clone)]
 pub(crate) struct SecurityState {
     token: Option<Arc<[u8]>>,
+    db: Option<PgPool>,
     buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
 }
 
@@ -37,7 +41,10 @@ struct RatePolicy {
 }
 
 impl SecurityState {
-    pub(crate) fn from_environment(cloud_runtime: bool) -> Result<Self, String> {
+    pub(crate) fn from_environment(
+        cloud_runtime: bool,
+        db: Option<PgPool>,
+    ) -> Result<Self, String> {
         let token = env::var(TOKEN_ENV)
             .ok()
             .map(|value| value.trim().as_bytes().to_vec())
@@ -57,11 +64,12 @@ impl SecurityState {
 
         Ok(Self {
             token: token.map(Arc::<[u8]>::from),
+            db,
             buckets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    fn authorized(&self, authorization: Option<&str>) -> bool {
+    fn master_authorized(&self, authorization: Option<&str>) -> bool {
         let Some(expected) = &self.token else {
             return true;
         };
@@ -70,6 +78,37 @@ impl SecurityState {
         };
         let received = received.trim().as_bytes();
         received.len() == expected.len() && constant_time_eq(received, expected)
+    }
+
+    async fn authorized(&self, authorization: Option<&str>) -> bool {
+        if self.master_authorized(authorization) {
+            return true;
+        }
+        let Some(received) = authorization
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| value.starts_with("tcdev_") && value.len() >= 40)
+        else {
+            return false;
+        };
+        let Some(pool) = &self.db else {
+            return false;
+        };
+        let token_hash = hex::encode(Sha256::digest(received.as_bytes()));
+        let valid = query(
+            r#"
+            SELECT s.device_id
+            FROM sessions s
+            WHERE s.token_hash = $1
+              AND s.revoked_at IS NULL
+              AND s.expires_at > NOW()
+            LIMIT 1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(pool)
+        .await;
+        matches!(valid, Ok(Some(_)))
     }
 
     fn rate_limited(&self, client: &str, policy: RatePolicy) -> bool {
@@ -154,7 +193,7 @@ pub(crate) async fn protect(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let authorized = security.authorized(authorization);
+    let authorized = security.authorized(authorization).await;
     let policy = policy_for(request.uri().path(), request.method().as_str(), authorized);
 
     if security.rate_limited(&client_key(&request), policy) {
@@ -195,10 +234,11 @@ mod tests {
             token: Some(Arc::<[u8]>::from(
                 b"01234567890123456789012345678901".as_slice(),
             )),
+            db: None,
             buckets: Arc::new(Mutex::new(HashMap::new())),
         };
-        assert!(!state.authorized(None));
-        assert!(!state.authorized(Some("Bearer 0123456789")));
-        assert!(state.authorized(Some("Bearer 01234567890123456789012345678901")));
+        assert!(!state.master_authorized(None));
+        assert!(!state.master_authorized(Some("Bearer 0123456789")));
+        assert!(state.master_authorized(Some("Bearer 01234567890123456789012345678901")));
     }
 }

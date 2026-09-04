@@ -25,6 +25,7 @@ use grammers_client::{
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx_core::row::Row;
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 use std::{
@@ -190,6 +191,45 @@ struct DeviceSummary {
     platform: String,
     app_version: Option<String>,
     last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingCodeRequest {
+    device_name: String,
+    platform: String,
+    app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingCodeResponse {
+    code: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeRequest {
+    code: String,
+    device_name: Option<String>,
+    platform: Option<String>,
+    app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeResponse {
+    ok: bool,
+    token: String,
+    device_id: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeDeviceRequest {
+    device_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -758,10 +798,9 @@ async fn main() {
             "127.0.0.1".to_string()
         }
     });
-    let security = security::SecurityState::from_environment(render_port.is_some())
-        .expect("configuracao de seguranca do TCloud Core invalida");
-
     let db = connect_database().await;
+    let security = security::SecurityState::from_environment(render_port.is_some(), db.clone())
+        .expect("configuracao de seguranca do TCloud Core invalida");
     let telegram = initialize_telegram(db.as_ref()).await;
 
     let state = AppState {
@@ -840,6 +879,8 @@ async fn main() {
         .route("/api/v1/folders", post(create_folder))
         .route("/api/v1/folders/delete", post(delete_folder_permanently))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/pairing", post(create_pairing_code))
+        .route("/api/v1/devices/revoke", post(revoke_device))
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/auth/request-code", post(request_code))
         .route("/api/v1/auth/verify-code", post(verify_code))
@@ -853,6 +894,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/v1/device-auth/exchange", post(exchange_pairing_code))
         .merge(protected_api)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -4974,6 +5016,177 @@ async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceSummary>>
         .collect();
 
     Json(devices)
+}
+
+fn clean_device_label(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn sha256_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+async fn create_pairing_code(
+    State(state): State<AppState>,
+    Json(request): Json<PairingCodeRequest>,
+) -> Result<Json<PairingCodeResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let device_name = clean_device_label(&request.device_name, "Novo dispositivo");
+    let platform = clean_device_label(&request.platform, "unknown").to_lowercase();
+    let code = Uuid::new_v4().simple().to_string()[..10].to_uppercase();
+    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    sqlx_core::query::query::<Postgres>(
+        r#"
+        INSERT INTO device_pairing_codes
+            (id, user_id, code_hash, device_name, platform, app_version, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(local_user_uuid())
+    .bind(sha256_hex(&code))
+    .bind(device_name)
+    .bind(platform)
+    .bind(
+        request
+            .app_version
+            .map(|value| clean_device_label(&value, "")),
+    )
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(PairingCodeResponse {
+        code,
+        expires_at: expires_at.to_rfc3339(),
+    }))
+}
+
+async fn exchange_pairing_code(
+    State(state): State<AppState>,
+    Json(request): Json<PairingExchangeRequest>,
+) -> Result<Json<PairingExchangeResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let code = request.code.trim().replace('-', "").to_uppercase();
+    if code.len() != 10 || !code.chars().all(|value| value.is_ascii_hexdigit()) {
+        return Err(mutation_error(
+            StatusCode::BAD_REQUEST,
+            "Codigo de pareamento invalido.",
+        ));
+    }
+    let row = sqlx_core::query::query::<Postgres>(
+        r#"
+        UPDATE device_pairing_codes
+        SET used_at = NOW()
+        WHERE code_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+        RETURNING user_id, device_name, platform, app_version
+        "#,
+    )
+    .bind(sha256_hex(&code))
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .ok_or_else(|| mutation_error(StatusCode::UNAUTHORIZED, "Codigo expirado ou ja utilizado."))?;
+
+    let user_id: Uuid = row.try_get("user_id").map_err(|_| {
+        mutation_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pareamento inconsistente.",
+        )
+    })?;
+    let stored_name: String = row
+        .try_get("device_name")
+        .unwrap_or_else(|_| "Novo dispositivo".into());
+    let stored_platform: String = row.try_get("platform").unwrap_or_else(|_| "unknown".into());
+    let stored_version: Option<String> = row.try_get("app_version").ok().flatten();
+    let device_name = clean_device_label(
+        request.device_name.as_deref().unwrap_or(&stored_name),
+        &stored_name,
+    );
+    let platform = clean_device_label(
+        request.platform.as_deref().unwrap_or(&stored_platform),
+        &stored_platform,
+    )
+    .to_lowercase();
+    let app_version = request
+        .app_version
+        .or(stored_version)
+        .map(|value| clean_device_label(&value, ""));
+    let device_id = Uuid::new_v4();
+    let token = format!(
+        "tcdev_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let expires_at = Utc::now() + chrono::Duration::days(365);
+
+    sqlx_core::query::query::<Postgres>(
+        r#"
+        INSERT INTO devices(id, user_id, name, platform, app_version, device_key, last_seen_at)
+        VALUES($1, $2, $3, $4, $5, $6, NOW())
+        "#,
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .bind(device_name)
+    .bind(platform)
+    .bind(app_version)
+    .bind(format!("paired:{device_id}"))
+    .execute(pool)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    sqlx_core::query::query::<Postgres>(
+        "INSERT INTO sessions(id,user_id,device_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(device_id)
+    .bind(sha256_hex(&token))
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(PairingExchangeResponse {
+        ok: true,
+        token,
+        device_id: device_id.to_string(),
+        expires_at: expires_at.to_rfc3339(),
+    }))
+}
+
+async fn revoke_device(
+    State(state): State<AppState>,
+    Json(request): Json<RevokeDeviceRequest>,
+) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let device_id = Uuid::parse_str(&request.device_id)
+        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de dispositivo invalido."))?;
+    sqlx_core::query::query::<Postgres>(
+        "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND device_id=$2 AND revoked_at IS NULL",
+    ).bind(local_user_uuid()).bind(device_id).execute(pool).await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(MutationResponse {
+        ok: true,
+        message: "Acesso do dispositivo revogado.".into(),
+        id: Some(device_id.to_string()),
+        parent_id: None,
+    }))
 }
 
 async fn database_files(pool: &PgPool) -> Result<Vec<TCloudItem>, sqlx_core::Error> {

@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "tcloud-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "argon2",
  "axum",
@@ -1998,6 +1998,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx-core",
  "sqlx-postgres",
  "tokio",

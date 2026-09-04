@@ -1,6 +1,6 @@
 [package]
 name = "tcloud-core"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,7 @@ hex = "0.4.3"
 constant_time_eq = "0.4.2"
 futures-util = "0.3.32"
 argon2 = "0.5.3"
+sha2 = "0.10.9"
 
 [patch.crates-io]
 core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e21351e0c69767958efe2a7" }
