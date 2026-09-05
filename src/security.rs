@@ -255,6 +255,26 @@ pub(crate) async fn protect(
     next.run(request).await
 }
 
+pub(crate) async fn protect_onboarding(
+    State(security): State<SecurityState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let policy = RatePolicy {
+        name: "onboarding",
+        limit: 5,
+        window: Duration::from_secs(60 * 60),
+    };
+    if security.rate_limited(&client_key(&request), policy) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"ok": false, "message": "Muitas contas criadas nesta rede. Tente novamente mais tarde."})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

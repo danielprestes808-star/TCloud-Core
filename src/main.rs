@@ -229,6 +229,24 @@ struct PairingExchangeResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct OnboardingRequest {
+    device_name: String,
+    platform: String,
+    app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnboardingResponse {
+    ok: bool,
+    user_id: String,
+    device_id: String,
+    token: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RevokeDeviceRequest {
     device_id: String,
 }
@@ -907,11 +925,22 @@ async fn main() {
         .route("/api/v1/index/status", get(index_status))
         .route("/api/v1/live/revision", get(live_revision))
         .route("/api/v1/dialogs", get(list_dialogs))
-        .layer(middleware::from_fn_with_state(security, security::protect));
+        .layer(middleware::from_fn_with_state(
+            security.clone(),
+            security::protect,
+        ));
+
+    let onboarding_api = Router::new()
+        .route("/api/v1/onboarding/register", post(register_account))
+        .layer(middleware::from_fn_with_state(
+            security,
+            security::protect_onboarding,
+        ));
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/device-auth/exchange", post(exchange_pairing_code))
+        .merge(onboarding_api)
         .merge(protected_api)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -1567,6 +1596,12 @@ async fn verify_code(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
+                if let Err(message) =
+                    claim_telegram_identity(pool, auth.user_id, user.bare_id()).await
+                {
+                    let _ = telegram.client.sign_out().await;
+                    return auth_error("phone-required", &message);
+                }
                 persist_authorized_account(
                     pool,
                     auth.user_id,
@@ -1647,6 +1682,12 @@ async fn verify_password(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
+                if let Err(message) =
+                    claim_telegram_identity(pool, auth.user_id, user.bare_id()).await
+                {
+                    let _ = telegram.client.sign_out().await;
+                    return auth_error("phone-required", &message);
+                }
                 persist_authorized_account(
                     pool,
                     auth.user_id,
@@ -1729,6 +1770,44 @@ fn auth_error(stage: &str, message: &str) -> Json<AuthActionResponse> {
 
 fn local_user_uuid() -> Uuid {
     Uuid::parse_str(LOCAL_USER_ID).expect("LOCAL_USER_ID valido")
+}
+
+async fn claim_telegram_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    telegram_user_id: i64,
+) -> Result<(), String> {
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    let updated = sqlx_core::query::query::<Postgres>(
+        r#"
+        UPDATE users
+        SET telegram_user_id=$2,
+            display_name=CASE WHEN display_name='Nova conta' THEN 'Conta Telegram' ELSE display_name END,
+            updated_at=NOW()
+        WHERE id=$1 AND (telegram_user_id IS NULL OR telegram_user_id=$2)
+        "#,
+    )
+    .bind(user_id)
+    .bind(telegram_user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "Esta conta Telegram ja esta vinculada a outro usuario do TCloud.".to_string())?;
+    if updated.rows_affected() != 1 {
+        return Err(
+            "A conta provisoria nao existe mais ou ja possui outra identidade.".to_string(),
+        );
+    }
+    sqlx_core::query::query::<Postgres>(
+        "UPDATE sessions SET expires_at=NOW()+INTERVAL '365 days' WHERE user_id=$1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn persist_authorized_account(
@@ -5247,6 +5326,76 @@ fn clean_device_label(value: &str, fallback: &str) -> String {
 
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+async fn register_account(
+    State(state): State<AppState>,
+    Json(request): Json<OnboardingRequest>,
+) -> Result<Json<OnboardingResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
+    let user_id = Uuid::new_v4();
+    let device_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let token = format!(
+        "tcdev_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let expires_at = Utc::now() + chrono::Duration::hours(1);
+    let device_name = clean_device_label(&request.device_name, "Primeiro dispositivo");
+    let platform = clean_device_label(&request.platform, "unknown").to_lowercase();
+    let app_version = request
+        .app_version
+        .map(|value| clean_device_label(&value, ""));
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    sqlx_core::query::query::<Postgres>(
+        "INSERT INTO users(id,display_name) VALUES($1,'Nova conta')",
+    )
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    sqlx_core::query::query::<Postgres>(
+        "INSERT INTO devices(id,user_id,name,platform,app_version,device_key,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,NOW())",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .bind(device_name)
+    .bind(platform)
+    .bind(app_version)
+    .bind(format!("onboarding:{device_id}"))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    sqlx_core::query::query::<Postgres>(
+        "INSERT INTO sessions(id,user_id,device_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(device_id)
+    .bind(sha256_hex(&token))
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    Ok(Json(OnboardingResponse {
+        ok: true,
+        user_id: user_id.to_string(),
+        device_id: device_id.to_string(),
+        token,
+        expires_at: expires_at.to_rfc3339(),
+    }))
 }
 
 async fn create_pairing_code(
