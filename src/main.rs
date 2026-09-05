@@ -50,6 +50,7 @@ struct AppState {
     db: Option<PgPool>,
     fallback_files: Arc<Vec<TCloudItem>>,
     telegram: Option<Arc<TelegramRuntime>>,
+    telegram_runtimes: Arc<Mutex<HashMap<Uuid, Arc<TelegramRuntime>>>>,
 }
 
 struct TelegramRuntime {
@@ -578,7 +579,7 @@ async fn get_media(
         StatusCode::SERVICE_UNAVAILABLE,
         "PostgreSQL indisponivel.".to_string(),
     ))?;
-    let telegram = state.telegram.as_ref().ok_or((
+    let telegram = telegram_for_user(&state, auth.user_id).await.ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Telegram indisponivel.".to_string(),
     ))?;
@@ -805,22 +806,34 @@ async fn main() {
     let db = connect_database().await;
     let security = security::SecurityState::from_environment(render_port.is_some(), db.clone())
         .expect("configuracao de seguranca do TCloud Core invalida");
-    let telegram = initialize_telegram(db.as_ref()).await;
+    let telegram = initialize_telegram(db.as_ref(), local_user_uuid()).await;
 
+    let mut initial_runtimes = HashMap::new();
+    if let Some(runtime) = telegram.as_ref().cloned() {
+        initial_runtimes.insert(local_user_uuid(), runtime);
+    }
     let state = AppState {
         db,
         fallback_files: Arc::new(seed_fallback_files()),
         telegram,
+        telegram_runtimes: Arc::new(Mutex::new(initial_runtimes)),
     };
 
-    if let (Some(telegram), Some(pool)) =
-        (state.telegram.as_ref().cloned(), state.db.as_ref().cloned())
-    {
+    if let Some(pool) = state.db.as_ref().cloned() {
+        let runtimes = Arc::clone(&state.telegram_runtimes);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if telegram_authorized(&telegram).await {
-                    persist_telegram_session_blob(&pool, &telegram.session_path).await;
+                let snapshots = runtimes
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(user_id, runtime)| (*user_id, Arc::clone(runtime)))
+                    .collect::<Vec<_>>();
+                for (user_id, runtime) in snapshots {
+                    if telegram_authorized(&runtime).await {
+                        persist_telegram_session_blob(&pool, user_id, &runtime.session_path).await;
+                    }
                 }
             }
         });
@@ -979,7 +992,7 @@ async fn main() {
         .await
         .expect("nao foi possivel iniciar o TCloud Core");
 
-    println!("TCloud Core 0.8.0: http://{address}");
+    println!("TCloud Core 0.9.0: http://{address}");
     println!(
         "PostgreSQL:         {}",
         if state.db.is_some() {
@@ -1002,7 +1015,7 @@ async fn main() {
         .expect("TCloud Core encerrou com erro");
 }
 
-async fn initialize_telegram(db: Option<&PgPool>) -> Option<Arc<TelegramRuntime>> {
+async fn initialize_telegram(db: Option<&PgPool>, user_id: Uuid) -> Option<Arc<TelegramRuntime>> {
     let api_id = env::var("TCLOUD_TELEGRAM_API_ID")
         .ok()?
         .trim()
@@ -1015,11 +1028,15 @@ async fn initialize_telegram(db: Option<&PgPool>) -> Option<Arc<TelegramRuntime>
         return None;
     }
 
-    let session_path = env::var("TCLOUD_TELEGRAM_SESSION")
-        .unwrap_or_else(|_| "data/tcloud-telegram.session".to_string());
+    let session_path = if user_id == local_user_uuid() {
+        env::var("TCLOUD_TELEGRAM_SESSION")
+            .unwrap_or_else(|_| "data/tcloud-telegram.session".to_string())
+    } else {
+        format!("data/telegram-sessions/{user_id}.session")
+    };
 
     if let Some(pool) = db {
-        restore_telegram_session_blob(pool, &session_path).await;
+        restore_telegram_session_blob(pool, user_id, &session_path).await;
     }
 
     if let Some(parent) = PathBuf::from(&session_path).parent() {
@@ -1052,7 +1069,21 @@ async fn initialize_telegram(db: Option<&PgPool>) -> Option<Arc<TelegramRuntime>
     }))
 }
 
-const TELEGRAM_SESSION_REMOTE_KEY: &str = "telegram-primary";
+async fn telegram_for_user(state: &AppState, user_id: Uuid) -> Option<Arc<TelegramRuntime>> {
+    if let Some(runtime) = state.telegram_runtimes.lock().await.get(&user_id).cloned() {
+        return Some(runtime);
+    }
+
+    let runtime = initialize_telegram(state.db.as_ref(), user_id).await?;
+    let mut runtimes = state.telegram_runtimes.lock().await;
+    Some(runtimes.entry(user_id).or_insert_with(|| runtime).clone())
+}
+
+const LEGACY_TELEGRAM_SESSION_REMOTE_KEY: &str = "telegram-primary";
+
+fn telegram_session_remote_key(user_id: Uuid) -> String {
+    format!("telegram-account:{user_id}")
+}
 
 fn telegram_session_cipher() -> Option<ChaCha20Poly1305> {
     let raw = env::var("TCLOUD_SESSION_ENCRYPTION_KEY").ok()?;
@@ -1089,7 +1120,7 @@ fn decrypt_telegram_session(packed: &[u8]) -> Option<Vec<u8>> {
     cipher.decrypt(nonce, &packed[12..]).ok()
 }
 
-async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
+async fn restore_telegram_session_blob(pool: &PgPool, user_id: Uuid, session_path: &str) {
     // TCLOUD_CLOUD_FRESH_SESSION_BOOT_100
     // Render usa filesystem efemero, mas uma instancia nova ainda pode iniciar com
     // um arquivo de sessao presente no runtime. Em cloud, o PostgreSQL e a fonte
@@ -1116,10 +1147,16 @@ async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
         r#"
         SELECT encrypted_payload
         FROM tcloud_private.core_runtime_sessions
-        WHERE session_key = $1
+        WHERE user_id = $1
+          AND (session_key = $2 OR ($3 AND session_key = $4))
+        ORDER BY CASE WHEN session_key = $2 THEN 0 ELSE 1 END
+        LIMIT 1
         "#,
     )
-    .bind(TELEGRAM_SESSION_REMOTE_KEY)
+    .bind(user_id)
+    .bind(telegram_session_remote_key(user_id))
+    .bind(user_id == local_user_uuid())
+    .bind(LEGACY_TELEGRAM_SESSION_REMOTE_KEY)
     .fetch_optional(pool)
     .await
     {
@@ -1185,7 +1222,7 @@ async fn restore_telegram_session_blob(pool: &PgPool, session_path: &str) {
     }
 }
 
-async fn persist_telegram_session_blob(pool: &PgPool, session_path: &str) {
+async fn persist_telegram_session_blob(pool: &PgPool, user_id: Uuid, session_path: &str) {
     if telegram_session_cipher().is_none() {
         return;
     }
@@ -1204,19 +1241,22 @@ async fn persist_telegram_session_blob(pool: &PgPool, session_path: &str) {
         r#"
         INSERT INTO tcloud_private.core_runtime_sessions (
             session_key,
+            user_id,
             encrypted_payload,
             payload_bytes,
             updated_at
         )
-        VALUES ($1, $2, $3, NOW())
-        ON CONFLICT (session_key)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (user_id)
         DO UPDATE SET
+            session_key = EXCLUDED.session_key,
             encrypted_payload = EXCLUDED.encrypted_payload,
             payload_bytes = EXCLUDED.payload_bytes,
             updated_at = NOW()
         "#,
     )
-    .bind(TELEGRAM_SESSION_REMOTE_KEY)
+    .bind(telegram_session_remote_key(user_id))
+    .bind(user_id)
     .bind(encrypted)
     .bind(payload.len() as i64)
     .execute(pool)
@@ -1316,7 +1356,7 @@ async fn platform_capabilities() -> Json<PlatformCapabilities> {
     Json(PlatformCapabilities {
         foundation: "5.0",
         api_version: "v1",
-        core_version: "0.8.0",
+        core_version: "0.9.0",
         forum_management: true,
         folder_management: true,
         upload: true,
@@ -1374,15 +1414,15 @@ async fn status(
         )
     };
 
-    let telegram_connected = if let Some(telegram) = &state.telegram {
-        auth.is_master && telegram_authorized(telegram).await
+    let telegram_connected = if let Some(telegram) = telegram_for_user(&state, auth.user_id).await {
+        telegram_authorized(&telegram).await
     } else {
         false
     };
 
     Json(CoreStatus {
         name: "TCloud Core",
-        version: "0.8.0",
+        version: "0.9.0",
         connected: true,
         telegram_connected,
         telegram_credentials_ready: state.telegram.is_some(),
@@ -1403,19 +1443,7 @@ async fn auth_status(
     State(state): State<AppState>,
     Extension(auth): Extension<security::AuthenticatedUser>,
 ) -> Json<TelegramAuthStatus> {
-    if !auth.is_master {
-        return Json(TelegramAuthStatus {
-            credentials_configured: state.telegram.is_some(),
-            authorized: false,
-            stage: "account-session-required".to_string(),
-            session_owner: "account",
-            can_request_code: false,
-            password_required: false,
-            password_hint: None,
-            message: "A sessao Telegram individual desta conta ainda nao foi criada.".to_string(),
-        });
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Json(TelegramAuthStatus {
             credentials_configured: false,
             authorized: false,
@@ -1428,7 +1456,7 @@ async fn auth_status(
         });
     };
 
-    let authorized = telegram_authorized(telegram).await;
+    let authorized = telegram_authorized(&telegram).await;
     let password_required = telegram.password_token.lock().await.is_some();
     let code_required = telegram.login_token.lock().await.is_some();
 
@@ -1469,17 +1497,11 @@ async fn request_code(
     Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<PhoneRequest>,
 ) -> Json<AuthActionResponse> {
-    if !auth.is_master {
-        return auth_error(
-            "account-session-required",
-            "Esta conta ainda nao possui uma sessao Telegram individual.",
-        );
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return auth_error("credentials-required", "Credenciais Telegram ausentes.");
     };
 
-    if telegram_authorized(telegram).await {
+    if telegram_authorized(&telegram).await {
         return auth_success("authorized", "Telegram ja esta conectado.");
     }
 
@@ -1516,17 +1538,11 @@ async fn verify_code(
     Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<CodeRequest>,
 ) -> Json<AuthActionResponse> {
-    if !auth.is_master {
-        return auth_error(
-            "account-session-required",
-            "Esta conta ainda nao possui uma sessao Telegram individual.",
-        );
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return auth_error("credentials-required", "Telegram nao configurado.");
     };
 
-    if telegram_authorized(telegram).await {
+    if telegram_authorized(&telegram).await {
         return auth_success("authorized", "Telegram ja esta conectado.");
     }
 
@@ -1558,6 +1574,7 @@ async fn verify_code(
                     &telegram.session_path,
                 )
                 .await;
+                persist_telegram_session_blob(pool, auth.user_id, &telegram.session_path).await;
             }
 
             auth_success("authorized", "Telegram conectado com sucesso.")
@@ -1602,13 +1619,7 @@ async fn verify_password(
     Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<PasswordRequest>,
 ) -> Json<AuthActionResponse> {
-    if !auth.is_master {
-        return auth_error(
-            "account-session-required",
-            "Esta conta ainda nao possui uma sessao Telegram individual.",
-        );
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return auth_error("credentials-required", "Telegram nao configurado.");
     };
 
@@ -1643,6 +1654,7 @@ async fn verify_password(
                     &telegram.session_path,
                 )
                 .await;
+                persist_telegram_session_blob(pool, auth.user_id, &telegram.session_path).await;
             }
 
             auth_success("authorized", "Telegram conectado com 2FA.")
@@ -1662,13 +1674,7 @@ async fn logout(
     State(state): State<AppState>,
     Extension(auth): Extension<security::AuthenticatedUser>,
 ) -> Json<AuthActionResponse> {
-    if !auth.is_master {
-        return auth_error(
-            "account-session-required",
-            "Nenhuma sessao Telegram individual ativa para esta conta.",
-        );
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return auth_success("phone-required", "Telegram ja estava desconectado.");
     };
 
@@ -1779,15 +1785,7 @@ async fn queue_telegram_index(
     Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<IndexRequest>,
 ) -> Json<IndexRunResponse> {
-    if !auth.is_master {
-        return Json(IndexRunResponse {
-            accepted: false,
-            id: None,
-            status: "account-session-required".to_string(),
-            message: "A sessao Telegram individual desta conta ainda nao foi criada.".to_string(),
-        });
-    }
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Json(IndexRunResponse {
             accepted: false,
             id: None,
@@ -1796,7 +1794,7 @@ async fn queue_telegram_index(
         });
     };
 
-    if !telegram_authorized(telegram).await {
+    if !telegram_authorized(&telegram).await {
         return Json(IndexRunResponse {
             accepted: false,
             id: None,
@@ -1852,7 +1850,7 @@ async fn queue_telegram_index(
         });
     }
 
-    let telegram = Arc::clone(telegram);
+    let telegram = Arc::clone(&telegram);
     let pool = pool.clone();
 
     tokio::spawn(async move {
@@ -2999,8 +2997,8 @@ async fn index_status(
     State(state): State<AppState>,
     Extension(auth): Extension<security::AuthenticatedUser>,
 ) -> Json<IndexStatus> {
-    let authorized = if let Some(telegram) = &state.telegram {
-        auth.is_master && telegram_authorized(telegram).await
+    let authorized = if let Some(telegram) = telegram_for_user(&state, auth.user_id).await {
+        telegram_authorized(&telegram).await
     } else {
         false
     };
@@ -3194,14 +3192,14 @@ async fn create_forum(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
         ));
     };
 
-    if !telegram_authorized(telegram).await {
+    if !telegram_authorized(&telegram).await {
         return Err(mutation_error(
             StatusCode::UNAUTHORIZED,
             "A sessão Telegram não está autorizada.",
@@ -3495,7 +3493,7 @@ async fn rename_forum(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -3641,7 +3639,7 @@ async fn delete_forum_permanently(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -3834,7 +3832,7 @@ async fn create_folder(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -4083,7 +4081,7 @@ async fn upload_file(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -4349,7 +4347,7 @@ async fn rename_file(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -4626,7 +4624,7 @@ async fn delete_file_permanently(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
@@ -4716,7 +4714,7 @@ async fn delete_folder_permanently(
         ));
     };
 
-    let Some(telegram) = &state.telegram else {
+    let Some(telegram) = telegram_for_user(&state, auth.user_id).await else {
         return Err(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Telegram não está conectado.",
