@@ -470,6 +470,7 @@ fn channel_input_peer(peer: &grammers_client::types::Peer) -> Result<tl::enums::
 async fn mutation_input_peer(
     client: &Client,
     pool: &PgPool,
+    user_id: Uuid,
     target_peer_id: i64,
 ) -> Result<tl::enums::InputPeer, String> {
     let credential = sqlx_core::query::query::<Postgres>(
@@ -483,7 +484,7 @@ async fn mutation_input_peer(
         LIMIT 1
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(user_id)
     .bind(target_peer_id)
     .fetch_optional(pool)
     .await
@@ -509,6 +510,7 @@ async fn mutation_input_peer(
 async fn mutation_input_channel(
     client: &Client,
     pool: &PgPool,
+    user_id: Uuid,
     target_peer_id: i64,
 ) -> Result<tl::enums::InputChannel, String> {
     let credential = sqlx_core::query::query::<Postgres>(
@@ -522,7 +524,7 @@ async fn mutation_input_channel(
         LIMIT 1
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(user_id)
     .bind(target_peer_id)
     .fetch_optional(pool)
     .await
@@ -2459,7 +2461,8 @@ async fn index_telegram_content(
         // TCLOUD_TOPIC_DISCOVERY_773
         if is_forum {
             // TCLOUD_TOPIC_PEER_774
-            let input_peer = mutation_input_peer(&telegram.client, pool, peer_id).await?;
+            let input_peer =
+                mutation_input_peer(&telegram.client, pool, local_user_uuid(), peer_id).await?;
 
             let remote_topics = fetch_forum_topics(&telegram.client, input_peer).await?;
 
@@ -3103,6 +3106,7 @@ async fn list_forums(
 
 async fn create_forum(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<NameMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let clean_name = clean_mutation_name(&request.name)
@@ -3140,7 +3144,7 @@ async fn create_forum(
           AND deleted_at IS NULL
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(&clean_name)
     .fetch_one(pool)
     .await
@@ -3282,7 +3286,7 @@ async fn create_forum(
             updated_at = NOW()
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .bind(channel_id)
     .bind(access_hash)
@@ -3352,7 +3356,7 @@ async fn create_forum(
             "#,
     )
     .bind(Uuid::new_v4())
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .bind(&clean_name)
     .fetch_one(pool)
@@ -3368,7 +3372,7 @@ async fn create_forum(
                   AND telegram_peer_id = $2
                 "#,
             )
-            .bind(local_user_uuid())
+            .bind(auth.user_id)
             .bind(peer_id)
             .execute(pool)
             .await;
@@ -3400,6 +3404,7 @@ async fn create_forum(
 
 async fn rename_forum(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileNameMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let forum_uuid = Uuid::parse_str(&request.id)
@@ -3438,7 +3443,7 @@ async fn rename_forum(
         "#,
     )
     .bind(forum_uuid)
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -3473,7 +3478,7 @@ async fn rename_forum(
           AND deleted_at IS NULL
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(forum_uuid)
     .bind(&clean_name)
     .fetch_one(pool)
@@ -3487,7 +3492,7 @@ async fn rename_forum(
         ));
     }
 
-    let input_channel = mutation_input_channel(&telegram.client, pool, peer_id)
+    let input_channel = mutation_input_channel(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -3516,7 +3521,7 @@ async fn rename_forum(
         "#,
     )
     .bind(forum_uuid)
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(&clean_name)
     .execute(pool)
     .await
@@ -3532,7 +3537,7 @@ async fn rename_forum(
           AND telegram_peer_id = $2
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .bind(&clean_name)
     .execute(pool)
@@ -3548,6 +3553,7 @@ async fn rename_forum(
 
 async fn delete_forum_permanently(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileIdMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let forum_uuid = Uuid::parse_str(&request.id)
@@ -3583,7 +3589,7 @@ async fn delete_forum_permanently(
         "#,
     )
     .bind(forum_uuid)
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -3624,7 +3630,7 @@ async fn delete_forum_permanently(
             LIMIT 1
             "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .fetch_optional(pool)
     .await
@@ -3646,7 +3652,7 @@ async fn delete_forum_permanently(
           AND telegram_peer_id = $2
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .fetch_one(pool)
     .await
@@ -3659,7 +3665,7 @@ async fn delete_forum_permanently(
         ));
     }
 
-    let input_channel = mutation_input_channel(&telegram.client, pool, peer_id)
+    let input_channel = mutation_input_channel(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -3684,7 +3690,7 @@ async fn delete_forum_permanently(
           AND parent_id IS NOT NULL
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .execute(pool)
     .await
@@ -3698,7 +3704,7 @@ async fn delete_forum_permanently(
         "#,
     )
     .bind(forum_uuid)
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -3710,7 +3716,7 @@ async fn delete_forum_permanently(
           AND telegram_peer_id = $2
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .execute(pool)
     .await
@@ -3723,7 +3729,7 @@ async fn delete_forum_permanently(
           AND telegram_peer_id = $2
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(peer_id)
     .execute(pool)
     .await;
@@ -3737,6 +3743,7 @@ async fn delete_forum_permanently(
 
 async fn create_folder(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<CreateFolderRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let clean_name = clean_mutation_name(&request.name)
@@ -3767,6 +3774,7 @@ async fn create_folder(
             is_forum
         FROM telegram_index_folders
         WHERE id = $1
+          AND user_id = $2
           AND parent_id IS NULL
           AND telegram_topic_id = 0
           AND deleted_at IS NULL
@@ -3774,6 +3782,7 @@ async fn create_folder(
         "#,
     )
     .bind(parent_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -3798,7 +3807,7 @@ async fn create_folder(
         .try_get::<i64, _>("telegram_peer_id")
         .unwrap_or_default();
 
-    let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
+    let input_peer = mutation_input_peer(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -3902,7 +3911,7 @@ async fn create_folder(
             "#,
     )
     .bind(Uuid::new_v4())
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(parent_uuid)
     .bind(peer_id)
     .bind(i64::from(topic_id))
@@ -3920,6 +3929,7 @@ async fn create_folder(
 
 async fn upload_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
@@ -4010,12 +4020,13 @@ async fn upload_file(
             r#"
             SELECT parent_id, telegram_peer_id, telegram_topic_id, name, size_bytes
             FROM telegram_index_files
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $2
               AND deleted_at IS NULL
             LIMIT 1
             "#,
         )
         .bind(file_uuid)
+        .bind(auth.user_id)
         .fetch_optional(pool)
         .await
         .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4051,12 +4062,13 @@ async fn upload_file(
             r#"
             SELECT telegram_peer_id, telegram_topic_id
             FROM telegram_index_folders
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $2
               AND deleted_at IS NULL
             LIMIT 1
             "#,
         )
         .bind(parent_uuid)
+        .bind(auth.user_id)
         .fetch_optional(pool)
         .await
         .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4079,7 +4091,7 @@ async fn upload_file(
         )
     };
 
-    let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
+    let input_peer = mutation_input_peer(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -4141,7 +4153,7 @@ async fn upload_file(
                 deleted_at = NULL,
                 trashed_at = NULL,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $8
             RETURNING id
             "#,
         )
@@ -4152,6 +4164,7 @@ async fn upload_file(
         .bind(body_len as i64)
         .bind(&mime)
         .bind(sent.date())
+        .bind(auth.user_id)
         .fetch_one(pool)
         .await
         .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
@@ -4217,7 +4230,7 @@ async fn upload_file(
             "#,
         )
         .bind(file_id)
-        .bind(local_user_uuid())
+        .bind(auth.user_id)
         .bind(parent_uuid)
         .bind(peer_id)
         .bind(topic_id)
@@ -4245,6 +4258,7 @@ async fn upload_file(
 
 async fn rename_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileNameMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let file_uuid = Uuid::parse_str(&request.id)
@@ -4273,12 +4287,13 @@ async fn rename_file(
             telegram_peer_id,
             telegram_message_id
         FROM telegram_index_files
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
           AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4301,7 +4316,7 @@ async fn rename_file(
     let message_i32 = i32::try_from(message_id)
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "Mensagem Telegram inválida."))?;
 
-    let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
+    let input_peer = mutation_input_peer(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -4327,11 +4342,12 @@ async fn rename_file(
             name = $2,
             source = 'web-rename',
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $3
         "#,
     )
     .bind(file_uuid)
     .bind(&clean_name)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4345,6 +4361,7 @@ async fn rename_file(
 
 async fn move_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileParentMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let file_uuid = Uuid::parse_str(&request.id)
@@ -4364,12 +4381,13 @@ async fn move_file(
         r#"
             SELECT telegram_topic_id
             FROM telegram_index_folders
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $2
               AND deleted_at IS NULL
             LIMIT 1
             "#,
     )
     .bind(parent_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4390,13 +4408,14 @@ async fn move_file(
             manual_parent_override = TRUE,
             source = 'web-move',
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $4
           AND deleted_at IS NULL
         "#,
     )
     .bind(file_uuid)
     .bind(parent_uuid)
     .bind(target_topic)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4417,6 +4436,7 @@ async fn move_file(
 
 async fn trash_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileIdMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let file_uuid = Uuid::parse_str(&request.id)
@@ -4440,11 +4460,12 @@ async fn trash_file(
             sync_state = 'trash',
             source = 'web-trash',
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
           AND deleted_at IS NULL
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4465,6 +4486,7 @@ async fn trash_file(
 
 async fn restore_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileIdMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let file_uuid = Uuid::parse_str(&request.id)
@@ -4490,11 +4512,12 @@ async fn restore_file(
             sync_state = 'online',
             source = 'web-restore',
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
           AND manual_trash = TRUE
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4515,6 +4538,7 @@ async fn restore_file(
 
 async fn delete_file_permanently(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileIdMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let file_uuid = Uuid::parse_str(&request.id)
@@ -4540,11 +4564,12 @@ async fn delete_file_permanently(
             telegram_peer_id,
             telegram_message_id
         FROM telegram_index_files
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
         LIMIT 1
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4567,7 +4592,7 @@ async fn delete_file_permanently(
     let message_i32 = i32::try_from(message_id)
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "Mensagem Telegram inválida."))?;
 
-    let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
+    let input_peer = mutation_input_peer(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -4585,10 +4610,11 @@ async fn delete_file_permanently(
     sqlx_core::query::query::<Postgres>(
         r#"
         DELETE FROM telegram_index_files
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4602,6 +4628,7 @@ async fn delete_file_permanently(
 
 async fn delete_folder_permanently(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FileIdMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let folder_uuid = Uuid::parse_str(&request.id)
@@ -4628,12 +4655,13 @@ async fn delete_folder_permanently(
             telegram_peer_id,
             telegram_topic_id
         FROM telegram_index_folders
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
           AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
     .bind(folder_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4666,11 +4694,12 @@ async fn delete_folder_permanently(
         r#"
             SELECT COUNT(*)
             FROM telegram_index_files
-            WHERE parent_id = $1
+            WHERE parent_id = $1 AND user_id = $2
               AND deleted_at IS NULL
             "#,
     )
     .bind(folder_uuid)
+    .bind(auth.user_id)
     .fetch_one(pool)
     .await
     .unwrap_or_default();
@@ -4682,7 +4711,7 @@ async fn delete_folder_permanently(
         ));
     }
 
-    let input_peer = mutation_input_peer(&telegram.client, pool, peer_id)
+    let input_peer = mutation_input_peer(&telegram.client, pool, auth.user_id, peer_id)
         .await
         .map_err(|message| mutation_error(StatusCode::BAD_GATEWAY, message))?;
 
@@ -4707,10 +4736,11 @@ async fn delete_folder_permanently(
     sqlx_core::query::query::<Postgres>(
         r#"
         DELETE FROM telegram_index_folders
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
         "#,
     )
     .bind(folder_uuid)
+    .bind(auth.user_id)
     .execute(pool)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -4820,6 +4850,7 @@ async fn list_favorites(
 
 async fn set_favorite(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<FavoriteMutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let pool = state.db.as_ref().ok_or_else(|| {
@@ -4827,11 +4858,17 @@ async fn set_favorite(
     })?;
     let file_id = Uuid::parse_str(&request.file_id)
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de arquivo invalido."))?;
+    if !owned_file_exists(pool, auth.user_id, file_id).await {
+        return Err(mutation_error(
+            StatusCode::NOT_FOUND,
+            "Arquivo nao encontrado.",
+        ));
+    }
     if request.favorite {
         sqlx_core::query::query::<Postgres>(
             "INSERT INTO tcloud_favorites(user_id,file_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
         )
-        .bind(local_user_uuid())
+        .bind(auth.user_id)
         .bind(file_id)
         .execute(pool)
         .await
@@ -4840,7 +4877,7 @@ async fn set_favorite(
         sqlx_core::query::query::<Postgres>(
             "DELETE FROM tcloud_favorites WHERE user_id=$1 AND file_id=$2",
         )
-        .bind(local_user_uuid())
+        .bind(auth.user_id)
         .bind(file_id)
         .execute(pool)
         .await
@@ -4848,6 +4885,7 @@ async fn set_favorite(
     }
     record_activity(
         pool,
+        auth.user_id,
         Some(file_id),
         if request.favorite {
             "favorite.add"
@@ -4868,12 +4906,29 @@ async fn set_favorite(
     ))
 }
 
-async fn record_activity(pool: &PgPool, file_id: Option<Uuid>, action: &str, detail: Option<&str>) {
+async fn owned_file_exists(pool: &PgPool, user_id: Uuid, file_id: Uuid) -> bool {
+    sqlx_core::query_scalar::query_scalar::<Postgres, bool>(
+        "SELECT EXISTS(SELECT 1 FROM telegram_index_files WHERE id=$1 AND user_id=$2)",
+    )
+    .bind(file_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
+async fn record_activity(
+    pool: &PgPool,
+    user_id: Uuid,
+    file_id: Option<Uuid>,
+    action: &str,
+    detail: Option<&str>,
+) {
     let _ = sqlx_core::query::query::<Postgres>(
         "INSERT INTO tcloud_activity(id,user_id,file_id,action,detail) VALUES($1,$2,$3,$4,$5)",
     )
     .bind(Uuid::new_v4())
-    .bind(local_user_uuid())
+    .bind(user_id)
     .bind(file_id)
     .bind(action)
     .bind(detail)
@@ -4977,6 +5032,7 @@ async fn storage_breakdown(
 
 async fn create_share_link(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<ShareLinkRequest>,
 ) -> Result<Json<ShareLinkResponse>, (StatusCode, Json<MutationResponse>)> {
     let pool = state.db.as_ref().ok_or_else(|| {
@@ -4984,6 +5040,12 @@ async fn create_share_link(
     })?;
     let file_id = Uuid::parse_str(&request.file_id)
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de arquivo invalido."))?;
+    if !owned_file_exists(pool, auth.user_id, file_id).await {
+        return Err(mutation_error(
+            StatusCode::NOT_FOUND,
+            "Arquivo nao encontrado.",
+        ));
+    }
     let id = Uuid::new_v4();
     let token = Uuid::new_v4();
     let password_hash = request
@@ -5003,8 +5065,15 @@ async fn create_share_link(
         .filter(|v| *v > 0)
         .map(|hours| Utc::now() + chrono::Duration::hours(hours.min(24 * 365)));
     let max_downloads = request.max_downloads.filter(|v| *v > 0);
-    sqlx_core::query::query::<Postgres>("INSERT INTO tcloud_share_links(id,user_id,file_id,token,password_hash,expires_at,max_downloads) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(local_user_uuid()).bind(file_id).bind(token).bind(password_hash).bind(expires_at).bind(max_downloads).execute(pool).await.map_err(|error|mutation_error(StatusCode::BAD_REQUEST,error.to_string()))?;
-    record_activity(pool, Some(file_id), "share.create", Some(&id.to_string())).await;
+    sqlx_core::query::query::<Postgres>("INSERT INTO tcloud_share_links(id,user_id,file_id,token,password_hash,expires_at,max_downloads) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(auth.user_id).bind(file_id).bind(token).bind(password_hash).bind(expires_at).bind(max_downloads).execute(pool).await.map_err(|error|mutation_error(StatusCode::BAD_REQUEST,error.to_string()))?;
+    record_activity(
+        pool,
+        auth.user_id,
+        Some(file_id),
+        "share.create",
+        Some(&id.to_string()),
+    )
+    .await;
     Ok(Json(ShareLinkResponse {
         id: id.to_string(),
         token: token.to_string(),
