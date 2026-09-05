@@ -962,6 +962,7 @@ async fn main() {
                     run_telegram_index(
                         Arc::clone(&telegram),
                         pool.clone(),
+                        local_user_uuid(),
                         run_id,
                         "delta".to_string(),
                     )
@@ -1398,7 +1399,22 @@ async fn status(
     })
 }
 
-async fn auth_status(State(state): State<AppState>) -> Json<TelegramAuthStatus> {
+async fn auth_status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<TelegramAuthStatus> {
+    if !auth.is_master {
+        return Json(TelegramAuthStatus {
+            credentials_configured: state.telegram.is_some(),
+            authorized: false,
+            stage: "account-session-required".to_string(),
+            session_owner: "account",
+            can_request_code: false,
+            password_required: false,
+            password_hint: None,
+            message: "A sessao Telegram individual desta conta ainda nao foi criada.".to_string(),
+        });
+    }
     let Some(telegram) = &state.telegram else {
         return Json(TelegramAuthStatus {
             credentials_configured: false,
@@ -1450,8 +1466,15 @@ async fn auth_status(State(state): State<AppState>) -> Json<TelegramAuthStatus> 
 
 async fn request_code(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<PhoneRequest>,
 ) -> Json<AuthActionResponse> {
+    if !auth.is_master {
+        return auth_error(
+            "account-session-required",
+            "Esta conta ainda nao possui uma sessao Telegram individual.",
+        );
+    }
     let Some(telegram) = &state.telegram else {
         return auth_error("credentials-required", "Credenciais Telegram ausentes.");
     };
@@ -1490,8 +1513,15 @@ async fn request_code(
 
 async fn verify_code(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<CodeRequest>,
 ) -> Json<AuthActionResponse> {
+    if !auth.is_master {
+        return auth_error(
+            "account-session-required",
+            "Esta conta ainda nao possui uma sessao Telegram individual.",
+        );
+    }
     let Some(telegram) = &state.telegram else {
         return auth_error("credentials-required", "Telegram nao configurado.");
     };
@@ -1521,7 +1551,13 @@ async fn verify_code(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
-                persist_authorized_account(pool, user.bare_id(), &telegram.session_path).await;
+                persist_authorized_account(
+                    pool,
+                    auth.user_id,
+                    user.bare_id(),
+                    &telegram.session_path,
+                )
+                .await;
             }
 
             auth_success("authorized", "Telegram conectado com sucesso.")
@@ -1563,8 +1599,15 @@ async fn verify_code(
 
 async fn verify_password(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<PasswordRequest>,
 ) -> Json<AuthActionResponse> {
+    if !auth.is_master {
+        return auth_error(
+            "account-session-required",
+            "Esta conta ainda nao possui uma sessao Telegram individual.",
+        );
+    }
     let Some(telegram) = &state.telegram else {
         return auth_error("credentials-required", "Telegram nao configurado.");
     };
@@ -1593,7 +1636,13 @@ async fn verify_password(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
-                persist_authorized_account(pool, user.bare_id(), &telegram.session_path).await;
+                persist_authorized_account(
+                    pool,
+                    auth.user_id,
+                    user.bare_id(),
+                    &telegram.session_path,
+                )
+                .await;
             }
 
             auth_success("authorized", "Telegram conectado com 2FA.")
@@ -1609,7 +1658,16 @@ async fn verify_password(
     }
 }
 
-async fn logout(State(state): State<AppState>) -> Json<AuthActionResponse> {
+async fn logout(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<AuthActionResponse> {
+    if !auth.is_master {
+        return auth_error(
+            "account-session-required",
+            "Nenhuma sessao Telegram individual ativa para esta conta.",
+        );
+    }
     let Some(telegram) = &state.telegram else {
         return auth_success("phone-required", "Telegram ja estava desconectado.");
     };
@@ -1630,7 +1688,7 @@ async fn logout(State(state): State<AppState>) -> Json<AuthActionResponse> {
                     WHERE user_id = $1
                     "#,
                 )
-                .bind(local_user_uuid())
+                .bind(auth.user_id)
                 .execute(pool)
                 .await;
             }
@@ -1667,7 +1725,12 @@ fn local_user_uuid() -> Uuid {
     Uuid::parse_str(LOCAL_USER_ID).expect("LOCAL_USER_ID valido")
 }
 
-async fn persist_authorized_account(pool: &PgPool, telegram_user_id: i64, session_path: &str) {
+async fn persist_authorized_account(
+    pool: &PgPool,
+    user_id: Uuid,
+    telegram_user_id: i64,
+    session_path: &str,
+) {
     let _ = sqlx_core::query::query::<Postgres>(
         r#"
         INSERT INTO telegram_accounts (
@@ -1704,7 +1767,7 @@ async fn persist_authorized_account(pool: &PgPool, telegram_user_id: i64, sessio
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(local_user_uuid())
+    .bind(user_id)
     .bind(telegram_user_id)
     .bind(session_path)
     .execute(pool)
@@ -1713,8 +1776,17 @@ async fn persist_authorized_account(pool: &PgPool, telegram_user_id: i64, sessio
 
 async fn queue_telegram_index(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<IndexRequest>,
 ) -> Json<IndexRunResponse> {
+    if !auth.is_master {
+        return Json(IndexRunResponse {
+            accepted: false,
+            id: None,
+            status: "account-session-required".to_string(),
+            message: "A sessao Telegram individual desta conta ainda nao foi criada.".to_string(),
+        });
+    }
     let Some(telegram) = &state.telegram else {
         return Json(IndexRunResponse {
             accepted: false,
@@ -1766,7 +1838,7 @@ async fn queue_telegram_index(
         "#,
     )
     .bind(run_id)
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(&mode)
     .execute(pool)
     .await;
@@ -1784,7 +1856,7 @@ async fn queue_telegram_index(
     let pool = pool.clone();
 
     tokio::spawn(async move {
-        run_telegram_index(telegram, pool, run_id, mode).await;
+        run_telegram_index(telegram, pool, auth.user_id, run_id, mode).await;
     });
 
     Json(IndexRunResponse {
@@ -1913,6 +1985,7 @@ fn unpack_raw_messages(response: tl::enums::messages::Messages) -> Vec<tl::enums
 async fn reconcile_forum_topics_by_search(
     client: &Client,
     pool: &PgPool,
+    user_id: Uuid,
     peer: &grammers_client::types::Peer,
     peer_id: i64,
     topic_folder_ids: &HashMap<i64, Uuid>,
@@ -2006,7 +2079,7 @@ async fn reconcile_forum_topics_by_search(
                           AND deleted_at IS NULL
                         "#,
                 )
-                .bind(local_user_uuid())
+                .bind(user_id)
                 .bind(peer_id)
                 .bind(*folder_id)
                 .bind(*topic_id)
@@ -2035,6 +2108,7 @@ async fn reconcile_forum_topics_by_search(
 async fn run_telegram_index(
     telegram: Arc<TelegramRuntime>,
     pool: PgPool,
+    user_id: Uuid,
     run_id: Uuid,
     mode: String,
 ) {
@@ -2053,7 +2127,7 @@ async fn run_telegram_index(
     .execute(&pool)
     .await;
 
-    let result = index_telegram_content(&telegram, &pool, &mode).await;
+    let result = index_telegram_content(&telegram, &pool, user_id, &mode).await;
 
     match result {
         Ok(counters) => {
@@ -2090,7 +2164,7 @@ async fn run_telegram_index(
                 WHERE user_id = $1
                 "#,
             )
-            .bind(local_user_uuid())
+            .bind(user_id)
             .execute(&pool)
             .await;
         }
@@ -2123,6 +2197,7 @@ async fn run_telegram_index(
 async fn index_telegram_content(
     telegram: &TelegramRuntime,
     pool: &PgPool,
+    user_id: Uuid,
     mode: &str,
 ) -> Result<IndexCounters, String> {
     let me = telegram
@@ -2166,7 +2241,7 @@ async fn index_telegram_content(
           AND deleted_at IS NULL
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -2226,7 +2301,7 @@ async fn index_telegram_content(
                         updated_at = NOW()
                     "#,
                 )
-                .bind(local_user_uuid())
+                .bind(user_id)
                 .bind(peer_id)
                 .bind(channel.raw.id)
                 .bind(access_hash)
@@ -2306,7 +2381,7 @@ async fn index_telegram_content(
             "#,
         )
         .bind(Uuid::new_v4())
-        .bind(local_user_uuid())
+        .bind(user_id)
         .bind(peer_id)
         .bind(&display_name)
         .bind(is_forum)
@@ -2361,7 +2436,7 @@ async fn index_telegram_content(
                 "#,
         )
         .bind(Uuid::new_v4())
-        .bind(local_user_uuid())
+        .bind(user_id)
         .bind(peer_id)
         .bind(&display_name)
         .bind(is_forum)
@@ -2416,7 +2491,7 @@ async fn index_telegram_content(
                     "#,
             )
             .bind(Uuid::new_v4())
-            .bind(local_user_uuid())
+            .bind(user_id)
             .bind(root_folder_id)
             .bind(peer_id)
             .bind(topic.id)
@@ -2441,7 +2516,7 @@ async fn index_telegram_content(
                   AND deleted_at IS NULL
                 "#,
         )
-        .bind(local_user_uuid())
+        .bind(user_id)
         .bind(peer_id)
         .fetch_all(pool)
         .await
@@ -2461,8 +2536,7 @@ async fn index_telegram_content(
         // TCLOUD_TOPIC_DISCOVERY_773
         if is_forum {
             // TCLOUD_TOPIC_PEER_774
-            let input_peer =
-                mutation_input_peer(&telegram.client, pool, local_user_uuid(), peer_id).await?;
+            let input_peer = mutation_input_peer(&telegram.client, pool, user_id, peer_id).await?;
 
             let remote_topics = fetch_forum_topics(&telegram.client, input_peer).await?;
 
@@ -2495,7 +2569,7 @@ async fn index_telegram_content(
                         "#,
                 )
                 .bind(Uuid::new_v4())
-                .bind(local_user_uuid())
+                .bind(user_id)
                 .bind(root_folder_id)
                 .bind(peer_id)
                 .bind(topic.id)
@@ -2518,7 +2592,7 @@ async fn index_telegram_content(
                   AND telegram_peer_id = $2
                 "#,
         )
-        .bind(local_user_uuid())
+        .bind(user_id)
         .bind(peer_id)
         .fetch_optional(pool)
         .await
@@ -2713,7 +2787,7 @@ async fn index_telegram_content(
                 "#,
             )
             .bind(Uuid::new_v4())
-            .bind(local_user_uuid())
+            .bind(user_id)
             .bind(parent_id)
             .bind(peer_id)
             .bind(topic_id)
@@ -2734,6 +2808,7 @@ async fn index_telegram_content(
             let _assigned_by_search = reconcile_forum_topics_by_search(
                 &telegram.client,
                 pool,
+                user_id,
                 &peer,
                 peer_id,
                 &topic_folder_ids,
@@ -2766,7 +2841,7 @@ async fn index_telegram_content(
                     last_indexed_at = NOW()
                 "#,
             )
-            .bind(local_user_uuid())
+            .bind(user_id)
             .bind(peer_id)
             .bind(highest_message_id)
             .execute(pool)
@@ -2785,7 +2860,7 @@ async fn index_telegram_content(
                   AND telegram_topic_id = 0
                 "#,
             )
-            .bind(local_user_uuid())
+            .bind(user_id)
             .bind(peer_id)
             .bind(highest_message_id)
             .execute(pool)
