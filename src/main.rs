@@ -3,7 +3,7 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
@@ -4971,7 +4971,10 @@ async fn get_file(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceSummary>> {
+async fn list_devices(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<DeviceSummary>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
@@ -4985,10 +4988,12 @@ async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceSummary>>
             app_version,
             last_seen_at
         FROM devices
+        WHERE user_id = $1
         ORDER BY last_seen_at DESC NULLS LAST, name
         LIMIT 100
         "#,
     )
+    .bind(auth.user_id)
     .fetch_all(pool)
     .await
     {
@@ -5038,6 +5043,7 @@ fn sha256_hex(value: &str) -> String {
 
 async fn create_pairing_code(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<PairingCodeRequest>,
 ) -> Result<Json<PairingCodeResponse>, (StatusCode, Json<MutationResponse>)> {
     let pool = state.db.as_ref().ok_or_else(|| {
@@ -5055,7 +5061,7 @@ async fn create_pairing_code(
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .bind(sha256_hex(&code))
     .bind(device_name)
     .bind(platform)
@@ -5170,6 +5176,7 @@ async fn exchange_pairing_code(
 
 async fn revoke_device(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<RevokeDeviceRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<MutationResponse>)> {
     let pool = state.db.as_ref().ok_or_else(|| {
@@ -5179,7 +5186,7 @@ async fn revoke_device(
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de dispositivo invalido."))?;
     sqlx_core::query::query::<Postgres>(
         "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND device_id=$2 AND revoked_at IS NULL",
-    ).bind(local_user_uuid()).bind(device_id).execute(pool).await
+    ).bind(auth.user_id).bind(device_id).execute(pool).await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(MutationResponse {
         ok: true,

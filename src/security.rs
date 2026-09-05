@@ -8,7 +8,7 @@ use axum::{
 use constant_time_eq::constant_time_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx_core::query::query;
+use sqlx_core::{query::query, row::Row};
 use sqlx_postgres::PgPool;
 use std::{
     collections::HashMap,
@@ -16,6 +16,17 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
+
+const LOCAL_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct AuthenticatedUser {
+    pub(crate) user_id: Uuid,
+    pub(crate) device_id: Option<Uuid>,
+    pub(crate) is_master: bool,
+}
 
 const TOKEN_ENV: &str = "TCLOUD_API_TOKEN";
 const MIN_TOKEN_BYTES: usize = 32;
@@ -80,24 +91,28 @@ impl SecurityState {
         received.len() == expected.len() && constant_time_eq(received, expected)
     }
 
-    async fn authorized(&self, authorization: Option<&str>) -> bool {
+    async fn authenticated_user(&self, authorization: Option<&str>) -> Option<AuthenticatedUser> {
         if self.master_authorized(authorization) {
-            return true;
+            return Some(AuthenticatedUser {
+                user_id: Uuid::parse_str(LOCAL_USER_ID).expect("LOCAL_USER_ID valido"),
+                device_id: None,
+                is_master: true,
+            });
         }
         let Some(received) = authorization
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::trim)
             .filter(|value| value.starts_with("tcdev_") && value.len() >= 40)
         else {
-            return false;
+            return None;
         };
         let Some(pool) = &self.db else {
-            return false;
+            return None;
         };
         let token_hash = hex::encode(Sha256::digest(received.as_bytes()));
         let valid = query(
             r#"
-            SELECT s.device_id
+            SELECT s.user_id, s.device_id
             FROM sessions s
             WHERE s.token_hash = $1
               AND s.revoked_at IS NULL
@@ -108,7 +123,12 @@ impl SecurityState {
         .bind(token_hash)
         .fetch_optional(pool)
         .await;
-        matches!(valid, Ok(Some(_)))
+        let row = valid.ok().flatten()?;
+        Some(AuthenticatedUser {
+            user_id: row.try_get("user_id").ok()?,
+            device_id: row.try_get::<Option<Uuid>, _>("device_id").ok().flatten(),
+            is_master: false,
+        })
     }
 
     fn rate_limited(&self, client: &str, policy: RatePolicy) -> bool {
@@ -207,8 +227,12 @@ pub(crate) async fn protect(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let authorized = security.authorized(authorization).await;
-    let policy = policy_for(request.uri().path(), request.method().as_str(), authorized);
+    let authenticated = security.authenticated_user(authorization).await;
+    let policy = policy_for(
+        request.uri().path(),
+        request.method().as_str(),
+        authenticated.is_some(),
+    );
 
     if security.rate_limited(&client_key(&request), policy) {
         return (
@@ -219,13 +243,15 @@ pub(crate) async fn protect(
         )
             .into_response();
     }
-    if !authorized {
+    let Some(authenticated) = authenticated else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"ok": false, "message": "Credencial do TCloud Core ausente ou invalida."})),
         )
             .into_response();
-    }
+    };
+    let mut request = request;
+    request.extensions_mut().insert(authenticated);
     next.run(request).await
 }
 
