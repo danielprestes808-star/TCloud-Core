@@ -564,6 +564,7 @@ async fn mutation_input_channel(
 
 async fn get_media(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, (StatusCode, String)> {
@@ -591,11 +592,12 @@ async fn get_media(
         r#"
         SELECT telegram_peer_id, telegram_message_id, size_bytes, mime
         FROM telegram_index_files
-        WHERE id=$1 AND deleted_at IS NULL
+        WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
     .bind(file_uuid)
+    .bind(auth.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
@@ -1332,27 +1334,45 @@ async fn platform_capabilities() -> Json<PlatformCapabilities> {
         protected_share_links: true,
     })
 }
-async fn status(State(state): State<AppState>) -> Json<CoreStatus> {
+async fn status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<CoreStatus> {
     let (files_count, devices_count, sessions_count) = if let Some(pool) = &state.db {
         (
-            count_query(
+            count_user_query(
                 pool,
-                "SELECT COUNT(*) FROM telegram_index_files WHERE deleted_at IS NULL",
+                "SELECT COUNT(*) FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL",
+                auth.user_id,
             )
             .await,
-            count_query(pool, "SELECT COUNT(*) FROM devices").await,
-            count_query(
+            count_user_query(
                 pool,
-                "SELECT COUNT(*) FROM sessions WHERE revoked_at IS NULL",
+                "SELECT COUNT(*) FROM devices WHERE user_id=$1",
+                auth.user_id,
+            )
+            .await,
+            count_user_query(
+                pool,
+                "SELECT COUNT(*) FROM sessions WHERE user_id=$1 AND revoked_at IS NULL",
+                auth.user_id,
             )
             .await,
         )
     } else {
-        (state.fallback_files.len() as i64, 0, 0)
+        (
+            if auth.is_master {
+                state.fallback_files.len() as i64
+            } else {
+                0
+            },
+            0,
+            0,
+        )
     };
 
     let telegram_connected = if let Some(telegram) = &state.telegram {
-        telegram_authorized(telegram).await
+        auth.is_master && telegram_authorized(telegram).await
     } else {
         false
     };
@@ -2825,7 +2845,10 @@ fn classify_file_kind(name: &str, mime: &str) -> String {
     "file".to_string()
 }
 
-async fn live_revision(State(state): State<AppState>) -> Json<LiveRevision> {
+async fn live_revision(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<LiveRevision> {
     let Some(pool) = &state.db else {
         return Json(LiveRevision {
             revision: "offline:0:0".to_string(),
@@ -2843,7 +2866,7 @@ async fn live_revision(State(state): State<AppState>) -> Json<LiveRevision> {
                     (
                         SELECT
                             (EXTRACT(EPOCH FROM MAX(updated_at)) * 1000)::BIGINT
-                        FROM telegram_index_files
+                        FROM telegram_index_files WHERE user_id = $1
                     ),
                     0
                 ),
@@ -2851,7 +2874,7 @@ async fn live_revision(State(state): State<AppState>) -> Json<LiveRevision> {
                     (
                         SELECT
                             (EXTRACT(EPOCH FROM MAX(updated_at)) * 1000)::BIGINT
-                        FROM telegram_index_folders
+                        FROM telegram_index_folders WHERE user_id = $1
                     ),
                     0
                 )
@@ -2859,15 +2882,16 @@ async fn live_revision(State(state): State<AppState>) -> Json<LiveRevision> {
             (
                 SELECT COUNT(*)::BIGINT
                 FROM telegram_index_files
-                WHERE deleted_at IS NULL
+                WHERE user_id = $1 AND deleted_at IS NULL
             ) AS files_count,
             (
                 SELECT COUNT(*)::BIGINT
                 FROM telegram_index_folders
-                WHERE deleted_at IS NULL
+                WHERE user_id = $1 AND deleted_at IS NULL
             ) AS folders_count
         "#,
     )
+    .bind(auth.user_id)
     .fetch_one(pool)
     .await;
 
@@ -2893,9 +2917,12 @@ async fn live_revision(State(state): State<AppState>) -> Json<LiveRevision> {
     }
 }
 
-async fn index_status(State(state): State<AppState>) -> Json<IndexStatus> {
+async fn index_status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<IndexStatus> {
     let authorized = if let Some(telegram) = &state.telegram {
-        telegram_authorized(telegram).await
+        auth.is_master && telegram_authorized(telegram).await
     } else {
         false
     };
@@ -2918,11 +2945,12 @@ async fn index_status(State(state): State<AppState>) -> Json<IndexStatus> {
                     messages_seen,
                     files_upserted
                 FROM index_runs
-                WHERE provider = 'telegram'
+                WHERE provider = 'telegram' AND user_id = $1
                 ORDER BY created_at DESC
                 LIMIT 1
                 "#,
         )
+        .bind(auth.user_id)
         .fetch_optional(pool)
         .await
     {
@@ -2949,7 +2977,10 @@ async fn index_status(State(state): State<AppState>) -> Json<IndexStatus> {
     })
 }
 
-async fn list_dialogs(State(state): State<AppState>) -> Json<Vec<TelegramDialogItem>> {
+async fn list_dialogs(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<TelegramDialogItem>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
@@ -2968,7 +2999,7 @@ async fn list_dialogs(State(state): State<AppState>) -> Json<Vec<TelegramDialogI
         LIMIT 1000
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .fetch_all(pool)
     .await
     {
@@ -2998,8 +3029,9 @@ async fn list_dialogs(State(state): State<AppState>) -> Json<Vec<TelegramDialogI
     Json(items)
 }
 
-async fn count_query(pool: &PgPool, sql: &'static str) -> i64 {
+async fn count_user_query(pool: &PgPool, sql: &'static str, user_id: Uuid) -> i64 {
     sqlx_core::query_scalar::query_scalar::<Postgres, i64>(sql)
+        .bind(user_id)
         .fetch_one(pool)
         .await
         .unwrap_or_default()
@@ -3014,7 +3046,10 @@ struct ForumSummary {
     deletable: bool,
 }
 
-async fn list_forums(State(state): State<AppState>) -> Json<Vec<ForumSummary>> {
+async fn list_forums(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<ForumSummary>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
@@ -3037,7 +3072,7 @@ async fn list_forums(State(state): State<AppState>) -> Json<Vec<ForumSummary>> {
         ORDER BY lower(f.name), f.name
         "#,
     )
-    .bind(local_user_uuid())
+    .bind(auth.user_id)
     .fetch_all(pool)
     .await
     {
@@ -4687,7 +4722,10 @@ async fn delete_folder_permanently(
     ))
 }
 
-async fn list_trash(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
+async fn list_trash(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<TCloudItem>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
@@ -4706,11 +4744,13 @@ async fn list_trash(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
             source
         FROM telegram_index_files
         WHERE manual_trash = TRUE
+          AND user_id = $1
           AND deleted_at IS NOT NULL
         ORDER BY trashed_at DESC NULLS LAST, name
         LIMIT 50000
         "#,
     )
+    .bind(auth.user_id)
     .fetch_all(pool)
     .await
     {
@@ -4721,18 +4761,26 @@ async fn list_trash(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
     Json(rows.into_iter().map(row_to_item).collect())
 }
 
-async fn list_files(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
+async fn list_files(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<TCloudItem>> {
     if let Some(pool) = &state.db
-        && let Ok(items) = database_files(pool).await
+        && let Ok(items) = database_files(pool, auth.user_id).await
     {
         return Json(items);
     }
 
-    Json(state.fallback_files.as_ref().clone())
+    Json(if auth.is_master {
+        state.fallback_files.as_ref().clone()
+    } else {
+        Vec::new()
+    })
 }
 
 async fn search_files(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Query(query): Query<SearchQuery>,
 ) -> Json<Vec<TCloudItem>> {
     let term = query.q.unwrap_or_default().trim().to_string();
@@ -4741,27 +4789,32 @@ async fn search_files(
     }
     let Some(pool) = &state.db else {
         let normalized = term.to_lowercase();
-        return Json(
+        return Json(if auth.is_master {
             state
                 .fallback_files
                 .iter()
                 .filter(|item| item.name.to_lowercase().contains(&normalized))
                 .take(200)
                 .cloned()
-                .collect(),
-        );
+                .collect()
+        } else {
+            Vec::new()
+        });
     };
     let rows = sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND name ILIKE $2 ORDER BY updated_at DESC LIMIT 200"#)
-        .bind(local_user_uuid()).bind(format!("%{}%", term)).fetch_all(pool).await.unwrap_or_default();
+        .bind(auth.user_id).bind(format!("%{}%", term)).fetch_all(pool).await.unwrap_or_default();
     Json(rows.into_iter().map(row_to_item).collect())
 }
 
-async fn list_favorites(State(state): State<AppState>) -> Json<Vec<TCloudItem>> {
+async fn list_favorites(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<TCloudItem>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
     let rows = sqlx_core::query::query::<Postgres>(r#"SELECT f.id::text AS id,f.parent_id::text AS parent_id,f.name,f.kind,f.size_bytes,f.mime,f.sync_state,f.updated_at,f.source FROM tcloud_favorites x JOIN telegram_index_files f ON f.id=x.file_id WHERE x.user_id=$1 AND f.deleted_at IS NULL ORDER BY x.created_at DESC LIMIT 5000"#)
-        .bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+        .bind(auth.user_id).fetch_all(pool).await.unwrap_or_default();
     Json(rows.into_iter().map(row_to_item).collect())
 }
 
@@ -4828,11 +4881,14 @@ async fn record_activity(pool: &PgPool, file_id: Option<Uuid>, action: &str, det
     .await;
 }
 
-async fn list_activity(State(state): State<AppState>) -> Json<Vec<ActivityItem>> {
+async fn list_activity(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<ActivityItem>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
-    let rows=sqlx_core::query::query::<Postgres>("SELECT id::text AS id,file_id::text AS file_id,action,detail,created_at FROM tcloud_activity WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500").bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+    let rows=sqlx_core::query::query::<Postgres>("SELECT id::text AS id,file_id::text AS file_id,action,detail,created_at FROM tcloud_activity WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500").bind(auth.user_id).fetch_all(pool).await.unwrap_or_default();
     Json(
         rows.into_iter()
             .map(|row| ActivityItem {
@@ -4849,16 +4905,19 @@ async fn list_activity(State(state): State<AppState>) -> Json<Vec<ActivityItem>>
     )
 }
 
-async fn list_duplicates(State(state): State<AppState>) -> Json<Vec<DuplicateGroup>> {
+async fn list_duplicates(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<Vec<DuplicateGroup>> {
     let Some(pool) = &state.db else {
         return Json(Vec::new());
     };
-    let rows=sqlx_core::query::query::<Postgres>(r#"SELECT lower(name) signature,size_bytes FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND size_bytes>0 GROUP BY lower(name),size_bytes HAVING COUNT(*)>1 ORDER BY size_bytes DESC LIMIT 100"#).bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default();
+    let rows=sqlx_core::query::query::<Postgres>(r#"SELECT lower(name) signature,size_bytes FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND size_bytes>0 GROUP BY lower(name),size_bytes HAVING COUNT(*)>1 ORDER BY size_bytes DESC LIMIT 100"#).bind(auth.user_id).fetch_all(pool).await.unwrap_or_default();
     let mut groups = Vec::new();
     for row in rows {
         let signature: String = row.try_get("signature").unwrap_or_default();
         let size: i64 = row.try_get("size_bytes").unwrap_or(0);
-        let files=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND lower(name)=$2 AND size_bytes=$3 ORDER BY updated_at"#).bind(local_user_uuid()).bind(&signature).bind(size).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect::<Vec<_>>();
+        let files=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL AND lower(name)=$2 AND size_bytes=$3 ORDER BY updated_at"#).bind(auth.user_id).bind(&signature).bind(size).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect::<Vec<_>>();
         groups.push(DuplicateGroup {
             signature: format!("{}:{}", signature, size),
             reclaimable_bytes: size.saturating_mul(files.len().saturating_sub(1) as i64),
@@ -4868,7 +4927,10 @@ async fn list_duplicates(State(state): State<AppState>) -> Json<Vec<DuplicateGro
     Json(groups)
 }
 
-async fn storage_breakdown(State(state): State<AppState>) -> Json<StorageBreakdown> {
+async fn storage_breakdown(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Json<StorageBreakdown> {
     let Some(pool) = &state.db else {
         return Json(StorageBreakdown {
             total_bytes: 0,
@@ -4880,8 +4942,8 @@ async fn storage_breakdown(State(state): State<AppState>) -> Json<StorageBreakdo
             largest_files: Vec::new(),
         });
     };
-    let row=sqlx_core::query::query::<Postgres>(r#"SELECT COALESCE(SUM(size_bytes),0)::bigint total,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'image/%'),0)::bigint images,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'video/%'),0)::bigint videos,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'audio/%'),0)::bigint audio,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'application/%' OR mime LIKE 'text/%'),0)::bigint documents FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL"#).bind(local_user_uuid()).fetch_one(pool).await.ok();
-    let largest=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL ORDER BY size_bytes DESC LIMIT 50"#).bind(local_user_uuid()).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect();
+    let row=sqlx_core::query::query::<Postgres>(r#"SELECT COALESCE(SUM(size_bytes),0)::bigint total,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'image/%'),0)::bigint images,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'video/%'),0)::bigint videos,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'audio/%'),0)::bigint audio,COALESCE(SUM(size_bytes) FILTER(WHERE mime LIKE 'application/%' OR mime LIKE 'text/%'),0)::bigint documents FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL"#).bind(auth.user_id).fetch_one(pool).await.ok();
+    let largest=sqlx_core::query::query::<Postgres>(r#"SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source FROM telegram_index_files WHERE user_id=$1 AND deleted_at IS NULL ORDER BY size_bytes DESC LIMIT 50"#).bind(auth.user_id).fetch_all(pool).await.unwrap_or_default().into_iter().map(row_to_item).collect();
     let total = row
         .as_ref()
         .and_then(|r| r.try_get("total").ok())
@@ -4954,14 +5016,18 @@ async fn create_share_link(
 
 async fn get_file(
     State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<TCloudItem>, StatusCode> {
     if let Some(pool) = &state.db
-        && let Ok(Some(item)) = database_file(pool, &id).await
+        && let Ok(Some(item)) = database_file(pool, auth.user_id, &id).await
     {
         return Ok(Json(item));
     }
 
+    if !auth.is_master {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .fallback_files
         .iter()
@@ -5196,7 +5262,7 @@ async fn revoke_device(
     }))
 }
 
-async fn database_files(pool: &PgPool) -> Result<Vec<TCloudItem>, sqlx_core::Error> {
+async fn database_files(pool: &PgPool, user_id: Uuid) -> Result<Vec<TCloudItem>, sqlx_core::Error> {
     let rows = sqlx_core::query::query::<Postgres>(
         r#"
         SELECT
@@ -5211,7 +5277,7 @@ async fn database_files(pool: &PgPool) -> Result<Vec<TCloudItem>, sqlx_core::Err
             f.source,
             1::integer AS sort_order
         FROM telegram_index_files f
-        WHERE f.deleted_at IS NULL
+        WHERE f.deleted_at IS NULL AND f.user_id = $1
 
         UNION ALL
 
@@ -5233,13 +5299,18 @@ async fn database_files(pool: &PgPool) -> Result<Vec<TCloudItem>, sqlx_core::Err
         LIMIT 50000
         "#,
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().map(row_to_item).collect())
 }
 
-async fn database_file(pool: &PgPool, id: &str) -> Result<Option<TCloudItem>, sqlx_core::Error> {
+async fn database_file(
+    pool: &PgPool,
+    user_id: Uuid,
+    id: &str,
+) -> Result<Option<TCloudItem>, sqlx_core::Error> {
     let row = sqlx_core::query::query::<Postgres>(
         r#"
         SELECT
@@ -5253,12 +5324,13 @@ async fn database_file(pool: &PgPool, id: &str) -> Result<Option<TCloudItem>, sq
             updated_at,
             source
         FROM telegram_index_files
-        WHERE id::text = $1
+        WHERE id::text = $1 AND user_id = $2
           AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
     .bind(id)
+    .bind(user_id)
     .fetch_optional(pool)
     .await?;
 
