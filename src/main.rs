@@ -5584,7 +5584,7 @@ async fn database_files(pool: &PgPool, user_id: Uuid) -> Result<Vec<TCloudItem>,
             d.source,
             0::integer AS sort_order
         FROM telegram_index_folders d
-        WHERE d.deleted_at IS NULL
+        WHERE d.deleted_at IS NULL AND d.user_id = $1
 
         ORDER BY sort_order, name
         LIMIT 50000
