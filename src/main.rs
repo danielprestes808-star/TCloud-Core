@@ -1596,20 +1596,22 @@ async fn verify_code(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
-                if let Err(message) =
-                    claim_telegram_identity(pool, auth.user_id, user.bare_id()).await
-                {
-                    let _ = telegram.client.sign_out().await;
-                    return auth_error("phone-required", &message);
-                }
+                let account_user_id =
+                    match claim_telegram_identity(pool, auth.user_id, user.bare_id()).await {
+                        Ok(account_user_id) => account_user_id,
+                        Err(message) => {
+                            let _ = telegram.client.sign_out().await;
+                            return auth_error("phone-required", &message);
+                        }
+                    };
                 persist_authorized_account(
                     pool,
-                    auth.user_id,
+                    account_user_id,
                     user.bare_id(),
                     &telegram.session_path,
                 )
                 .await;
-                persist_telegram_session_blob(pool, auth.user_id, &telegram.session_path).await;
+                persist_telegram_session_blob(pool, account_user_id, &telegram.session_path).await;
             }
 
             auth_success("authorized", "Telegram conectado com sucesso.")
@@ -1682,20 +1684,22 @@ async fn verify_password(
             *telegram.password_hint.lock().await = None;
 
             if let Some(pool) = &state.db {
-                if let Err(message) =
-                    claim_telegram_identity(pool, auth.user_id, user.bare_id()).await
-                {
-                    let _ = telegram.client.sign_out().await;
-                    return auth_error("phone-required", &message);
-                }
+                let account_user_id =
+                    match claim_telegram_identity(pool, auth.user_id, user.bare_id()).await {
+                        Ok(account_user_id) => account_user_id,
+                        Err(message) => {
+                            let _ = telegram.client.sign_out().await;
+                            return auth_error("phone-required", &message);
+                        }
+                    };
                 persist_authorized_account(
                     pool,
-                    auth.user_id,
+                    account_user_id,
                     user.bare_id(),
                     &telegram.session_path,
                 )
                 .await;
-                persist_telegram_session_blob(pool, auth.user_id, &telegram.session_path).await;
+                persist_telegram_session_blob(pool, account_user_id, &telegram.session_path).await;
             }
 
             auth_success("authorized", "Telegram conectado com 2FA.")
@@ -1776,8 +1780,43 @@ async fn claim_telegram_identity(
     pool: &PgPool,
     user_id: Uuid,
     telegram_user_id: i64,
-) -> Result<(), String> {
+) -> Result<Uuid, String> {
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+
+    let existing_user_id = sqlx_core::query_scalar::query_scalar::<Postgres, Uuid>(
+        r#"
+        SELECT id FROM users WHERE telegram_user_id=$1
+        UNION
+        SELECT user_id FROM telegram_accounts WHERE telegram_user_id=$1
+        LIMIT 1
+        "#,
+    )
+    .bind(telegram_user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    let account_user_id = existing_user_id.unwrap_or(user_id);
+
+    if account_user_id != user_id {
+        sqlx_core::query::query::<Postgres>("UPDATE devices SET user_id=$1 WHERE user_id=$2")
+            .bind(account_user_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx_core::query::query::<Postgres>("UPDATE sessions SET user_id=$1 WHERE user_id=$2")
+            .bind(account_user_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx_core::query::query::<Postgres>("DELETE FROM users WHERE id=$1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
     let updated = sqlx_core::query::query::<Postgres>(
         r#"
         UPDATE users
@@ -1787,7 +1826,7 @@ async fn claim_telegram_identity(
         WHERE id=$1 AND (telegram_user_id IS NULL OR telegram_user_id=$2)
         "#,
     )
-    .bind(user_id)
+    .bind(account_user_id)
     .bind(telegram_user_id)
     .execute(&mut *transaction)
     .await
@@ -1800,14 +1839,15 @@ async fn claim_telegram_identity(
     sqlx_core::query::query::<Postgres>(
         "UPDATE sessions SET expires_at=NOW()+INTERVAL '365 days' WHERE user_id=$1 AND revoked_at IS NULL",
     )
-    .bind(user_id)
+    .bind(account_user_id)
     .execute(&mut *transaction)
     .await
     .map_err(|error| error.to_string())?;
     transaction
         .commit()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(account_user_id)
 }
 
 async fn persist_authorized_account(
