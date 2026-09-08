@@ -102,13 +102,10 @@ impl SecurityState {
                 is_master: true,
             });
         }
-        let Some(received) = authorization
+        let received = authorization
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::trim)
-            .filter(|value| value.starts_with("tcdev_") && value.len() >= 40)
-        else {
-            return None;
-        };
+            .filter(|value| value.starts_with("tcdev_") && value.len() >= 40)?;
         let Some(pool) = &self.db else {
             return None;
         };
