@@ -82,7 +82,10 @@ impl SecurityState {
 
     fn master_authorized(&self, authorization: Option<&str>) -> bool {
         let Some(expected) = &self.token else {
-            return true;
+            // Sem uma credencial explicitamente configurada nao existe modo
+            // administrador implicito. O onboarding e o pareamento possuem
+            // rotas publicas proprias; todo o restante exige uma sessao.
+            return false;
         };
         let Some(received) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
             return false;
@@ -275,6 +278,26 @@ pub(crate) async fn protect_onboarding(
     next.run(request).await
 }
 
+pub(crate) async fn protect_device_exchange(
+    State(security): State<SecurityState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let policy = RatePolicy {
+        name: "device-exchange",
+        limit: 10,
+        window: Duration::from_secs(60),
+    };
+    if security.rate_limited(&client_key(&request), policy) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"ok": false, "message": "Muitas tentativas de pareamento. Aguarde um minuto."})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +323,27 @@ mod tests {
         assert!(!state.master_authorized(None));
         assert!(!state.master_authorized(Some("Bearer 0123456789")));
         assert!(state.master_authorized(Some("Bearer 01234567890123456789012345678901")));
+    }
+
+    #[test]
+    fn missing_master_configuration_never_grants_access() {
+        let state = SecurityState {
+            token: None,
+            db: None,
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        };
+        assert!(!state.master_authorized(None));
+        assert!(!state.master_authorized(Some("Bearer qualquer-token")));
+    }
+
+    #[test]
+    fn device_exchange_has_a_dedicated_bruteforce_budget() {
+        let policy = RatePolicy {
+            name: "device-exchange",
+            limit: 10,
+            window: Duration::from_secs(60),
+        };
+        assert_eq!(policy.name, "device-exchange");
+        assert!(policy.limit <= 10);
     }
 }

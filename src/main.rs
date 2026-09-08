@@ -933,13 +933,20 @@ async fn main() {
     let onboarding_api = Router::new()
         .route("/api/v1/onboarding/register", post(register_account))
         .layer(middleware::from_fn_with_state(
-            security,
+            security.clone(),
             security::protect_onboarding,
+        ));
+
+    let device_auth_api = Router::new()
+        .route("/api/v1/device-auth/exchange", post(exchange_pairing_code))
+        .layer(middleware::from_fn_with_state(
+            security,
+            security::protect_device_exchange,
         ));
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/api/v1/device-auth/exchange", post(exchange_pairing_code))
+        .merge(device_auth_api)
         .merge(onboarding_api)
         .merge(protected_api)
         .layer(cors)
@@ -5491,6 +5498,10 @@ async fn exchange_pairing_code(
             "Codigo de pareamento invalido.",
         ));
     }
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let row = sqlx_core::query::query::<Postgres>(
         r#"
         UPDATE device_pairing_codes
@@ -5500,7 +5511,7 @@ async fn exchange_pairing_code(
         "#,
     )
     .bind(sha256_hex(&code))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     .ok_or_else(|| mutation_error(StatusCode::UNAUTHORIZED, "Codigo expirado ou ja utilizado."))?;
@@ -5549,7 +5560,7 @@ async fn exchange_pairing_code(
     .bind(platform)
     .bind(app_version)
     .bind(format!("paired:{device_id}"))
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     sqlx_core::query::query::<Postgres>(
@@ -5560,9 +5571,13 @@ async fn exchange_pairing_code(
     .bind(device_id)
     .bind(sha256_hex(&token))
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(PairingExchangeResponse {
         ok: true,
         token,
