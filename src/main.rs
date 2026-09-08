@@ -66,6 +66,9 @@ struct TelegramRuntime {
 #[serde(rename_all = "camelCase")]
 struct TCloudItem {
     id: String,
+    telegram_peer_id: Option<i64>,
+    telegram_topic_id: Option<i32>,
+    telegram_message_id: Option<i64>,
     parent_id: Option<String>,
     name: String,
     kind: String,
@@ -5621,6 +5624,9 @@ async fn database_files(pool: &PgPool, user_id: Uuid) -> Result<Vec<TCloudItem>,
             f.sync_state,
             f.updated_at,
             f.source,
+            f.telegram_peer_id,
+            f.telegram_topic_id,
+            f.telegram_message_id,
             1::integer AS sort_order
         FROM telegram_index_files f
         WHERE f.deleted_at IS NULL AND f.user_id = $1
@@ -5637,6 +5643,9 @@ async fn database_files(pool: &PgPool, user_id: Uuid) -> Result<Vec<TCloudItem>,
             'online'::text AS sync_state,
             d.updated_at,
             d.source,
+            NULL::bigint AS telegram_peer_id,
+            d.telegram_topic_id,
+            NULL::bigint AS telegram_message_id,
             0::integer AS sort_order
         FROM telegram_index_folders d
         WHERE d.deleted_at IS NULL AND d.user_id = $1
@@ -5669,6 +5678,9 @@ async fn database_file(
             sync_state,
             updated_at,
             source
+            ,telegram_peer_id
+            ,telegram_topic_id
+            ,telegram_message_id
         FROM telegram_index_files
         WHERE id::text = $1 AND user_id = $2
           AND deleted_at IS NULL
@@ -5696,6 +5708,9 @@ fn row_to_item(row: sqlx_postgres::PgRow) -> TCloudItem {
 
     TCloudItem {
         id: row.try_get("id").unwrap_or_default(),
+        telegram_peer_id: row.try_get("telegram_peer_id").ok(),
+        telegram_topic_id: row.try_get("telegram_topic_id").ok(),
+        telegram_message_id: row.try_get("telegram_message_id").ok(),
         parent_id: row.try_get("parent_id").ok(),
         name: row.try_get("name").unwrap_or_default(),
         kind: row.try_get("kind").unwrap_or_else(|_| "file".to_string()),
