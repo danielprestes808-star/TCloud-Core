@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -234,14 +234,28 @@ pub(crate) async fn protect(
         authenticated.is_some(),
     );
 
-    if security.rate_limited(&client_key(&request), policy) {
-        return (
+    let rate_key = authenticated
+        .as_ref()
+        .map(|user| match user.device_id {
+            Some(device_id) => format!("user:{}:device:{device_id}", user.user_id),
+            None => format!("user:{}:master:{}", user.user_id, user.is_master),
+        })
+        .unwrap_or_else(|| client_key(&request));
+
+    if security.rate_limited(&rate_key, policy) {
+        let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(
                 json!({"ok": false, "message": "Muitas requisicoes. Tente novamente mais tarde."}),
             ),
         )
             .into_response();
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&policy.window.as_secs().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("60")),
+        );
+        return response;
     }
     let Some(authenticated) = authenticated else {
         return (
@@ -342,5 +356,21 @@ mod tests {
         };
         assert_eq!(policy.name, "device-exchange");
         assert!(policy.limit <= 10);
+    }
+
+    #[test]
+    fn authenticated_devices_have_independent_rate_keys() {
+        let user_id = Uuid::new_v4();
+        let first = AuthenticatedUser {
+            user_id,
+            device_id: Some(Uuid::new_v4()),
+            is_master: false,
+        };
+        let second = AuthenticatedUser {
+            user_id,
+            device_id: Some(Uuid::new_v4()),
+            is_master: false,
+        };
+        assert_ne!(first.device_id, second.device_id);
     }
 }
