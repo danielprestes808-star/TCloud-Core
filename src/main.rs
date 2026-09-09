@@ -8,7 +8,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chacha20poly1305::{
@@ -257,6 +257,7 @@ struct RevokeDeviceRequest {
 #[derive(Debug, Serialize)]
 struct Health {
     status: &'static str,
+    version: &'static str,
     database: &'static str,
     telegram: &'static str,
 }
@@ -949,6 +950,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .merge(device_auth_api)
         .merge(onboarding_api)
         .merge(protected_api)
@@ -1356,6 +1358,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
 
     Json(Health {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
         database: if state.db.is_some() {
             "connected"
         } else {
@@ -1363,6 +1366,47 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         },
         telegram: telegram_status,
     })
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let Some(pool) = &state.db else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not-ready",
+                "version": env!("CARGO_PKG_VERSION"),
+                "database": "unavailable"
+            })),
+        )
+            .into_response();
+    };
+
+    match sqlx_core::query::query::<Postgres>("SELECT 1")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "version": env!("CARGO_PKG_VERSION"),
+                "database": "connected"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            eprintln!("Readiness PostgreSQL falhou: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not-ready",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "database": "unavailable"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
