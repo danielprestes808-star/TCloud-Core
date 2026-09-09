@@ -234,6 +234,8 @@ struct PairingExchangeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OnboardingRequest {
+    display_name: Option<String>,
+    username: Option<String>,
     device_name: String,
     platform: String,
     app_version: Option<String>,
@@ -253,6 +255,23 @@ struct OnboardingResponse {
 #[serde(rename_all = "camelCase")]
 struct RevokeDeviceRequest {
     device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProfileRequest {
+    display_name: String,
+    username: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserProfileResponse {
+    id: String,
+    display_name: String,
+    username: Option<String>,
+    avatar_url: Option<String>,
+    profile_complete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -942,6 +961,7 @@ async fn main() {
         .route("/api/v1/folders", post(create_folder))
         .route("/api/v1/folders/delete", post(delete_folder_permanently))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/profile", get(get_profile).patch(update_profile))
         .route("/api/v1/devices/pairing", post(create_pairing_code))
         .route("/api/v1/devices/revoke", post(revoke_device))
         .route("/api/v1/auth/status", get(auth_status))
@@ -5645,6 +5665,79 @@ fn clean_device_label(value: &str, fallback: &str) -> String {
     }
 }
 
+fn clean_profile_name(value: &str) -> Result<String, (StatusCode, Json<MutationResponse>)> {
+    let cleaned: String = value
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(60)
+        .collect();
+    if cleaned.chars().count() < 2 {
+        return Err(mutation_error(StatusCode::BAD_REQUEST, "Informe seu nome."));
+    }
+    Ok(cleaned)
+}
+
+fn clean_username(value: &str) -> Result<String, (StatusCode, Json<MutationResponse>)> {
+    let cleaned = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    if cleaned.len() < 3 || cleaned.len() > 32 {
+        return Err(mutation_error(StatusCode::BAD_REQUEST, "O nome de usuario deve ter entre 3 e 32 caracteres."));
+    }
+    if !cleaned.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+        return Err(mutation_error(StatusCode::BAD_REQUEST, "Use apenas letras, numeros e sublinhado no nome de usuario."));
+    }
+    Ok(cleaned)
+}
+
+async fn get_profile(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+) -> Result<Json<UserProfileResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel."))?;
+    let row = sqlx_core::query::query::<Postgres>(
+        "SELECT id::text AS id,display_name,username,avatar_url FROM users WHERE id=$1"
+    ).bind(auth.user_id).fetch_one(pool).await
+        .map_err(|error| mutation_error(StatusCode::NOT_FOUND, error.to_string()))?;
+    let username = row.try_get::<Option<String>, _>("username").unwrap_or(None).filter(|value| !value.trim().is_empty());
+    let display_name = row.try_get::<String, _>("display_name").unwrap_or_default();
+    Ok(Json(UserProfileResponse {
+        id: row.try_get("id").unwrap_or_default(),
+        profile_complete: username.is_some() && display_name.trim() != "Nova conta" && display_name.trim().len() >= 2,
+        display_name,
+        username,
+        avatar_url: row.try_get("avatar_url").ok(),
+    }))
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    Extension(auth): Extension<security::AuthenticatedUser>,
+    Json(request): Json<UpdateProfileRequest>,
+) -> Result<Json<UserProfileResponse>, (StatusCode, Json<MutationResponse>)> {
+    let pool = state.db.as_ref().ok_or_else(|| mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel."))?;
+    let display_name = clean_profile_name(&request.display_name)?;
+    let username = clean_username(&request.username)?;
+    let result = sqlx_core::query::query::<Postgres>(
+        "UPDATE users SET display_name=$1,username=$2,updated_at=NOW() WHERE id=$3"
+    ).bind(&display_name).bind(&username).bind(auth.user_id).execute(pool).await;
+    if let Err(error) = result {
+        if error.to_string().to_ascii_lowercase().contains("unique") {
+            return Err(mutation_error(StatusCode::CONFLICT, "Este nome de usuario ja esta em uso."));
+        }
+        return Err(mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+    }
+    Ok(Json(UserProfileResponse {
+        id: auth.user_id.to_string(),
+        display_name,
+        username: Some(username),
+        avatar_url: None,
+        profile_complete: true,
+    }))
+}
+
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
@@ -5675,10 +5768,14 @@ async fn register_account(
         .await
         .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
+    let display_name = request.display_name.as_deref().map(clean_profile_name).transpose()?;
+    let username = request.username.as_deref().map(clean_username).transpose()?;
     sqlx_core::query::query::<Postgres>(
-        "INSERT INTO users(id,display_name) VALUES($1,'Nova conta')",
+        "INSERT INTO users(id,display_name,username) VALUES($1,$2,$3)",
     )
     .bind(user_id)
+    .bind(display_name.unwrap_or_else(|| "Nova conta".to_string()))
+    .bind(username)
     .execute(&mut *transaction)
     .await
     .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
