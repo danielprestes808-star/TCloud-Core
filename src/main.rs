@@ -1,5 +1,6 @@
 use argon2::{
-    Argon2, PasswordHasher,
+    Argon2, PasswordHasher, PasswordVerifier,
+    password_hash::PasswordHash,
     password_hash::{SaltString, rand_core::OsRng},
 };
 use axum::{
@@ -349,7 +350,10 @@ struct StorageBreakdown {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareLinkRequest {
-    file_id: String,
+    file_id: Option<String>,
+    folder_id: Option<String>,
+    folder_peer_id: Option<i64>,
+    folder_topic_id: Option<i32>,
     password: Option<String>,
     expires_in_hours: Option<i64>,
     max_downloads: Option<i32>,
@@ -363,6 +367,26 @@ struct ShareLinkResponse {
     path: String,
     expires_at: Option<String>,
     max_downloads: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicShareRequest {
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicMediaQuery {
+    access: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicShareResponse {
+    name: String,
+    kind: String,
+    access_token: String,
+    expires_at: String,
+    items: Vec<TCloudItem>,
 }
 
 fn mutation_ok(
@@ -948,10 +972,18 @@ async fn main() {
             security::protect_device_exchange,
         ));
 
+    let public_share_api = Router::new()
+        .route("/api/v1/public/shares/{token}", post(resolve_public_share))
+        .route(
+            "/api/v1/public/shares/{token}/media/{id}",
+            get(get_public_share_media),
+        );
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .merge(device_auth_api)
+        .merge(public_share_api)
         .merge(onboarding_api)
         .merge(protected_api)
         .layer(cors)
@@ -5276,6 +5308,149 @@ async fn storage_breakdown(
     })
 }
 
+async fn resolve_public_share(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Json(request): Json<PublicShareRequest>,
+) -> Result<Json<PublicShareResponse>, StatusCode> {
+    let pool = state.db.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let token = Uuid::parse_str(&token).map_err(|_| StatusCode::NOT_FOUND)?;
+    let row = sqlx_core::query::query::<Postgres>(
+        r#"
+        SELECT id,user_id,file_id,folder_id,password_hash,expires_at,max_downloads,download_count
+        FROM tcloud_share_links WHERE token=$1 AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
+          AND (max_downloads IS NULL OR download_count < max_downloads)
+    "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    if let Ok(hash) = row.try_get::<String, _>("password_hash") {
+        let parsed = PasswordHash::new(&hash).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let supplied = request.password.unwrap_or_default();
+        Argon2::default()
+            .verify_password(supplied.as_bytes(), &parsed)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    }
+    let share_id: Uuid = row
+        .try_get("id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user_id: Uuid = row
+        .try_get("user_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file_id: Option<Uuid> = row.try_get("file_id").ok();
+    let folder_id: Option<Uuid> = row.try_get("folder_id").ok();
+    let (name, kind, items) = if let Some(id) = file_id {
+        let item = database_file(pool, user_id, &id.to_string())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        (item.name.clone(), "file".to_string(), vec![item])
+    } else {
+        let id = folder_id.ok_or(StatusCode::NOT_FOUND)?;
+        let name = sqlx_core::query_scalar::query_scalar::<Postgres, String>(
+            "SELECT name FROM telegram_index_folders WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL"
+        ).bind(id).bind(user_id).fetch_optional(pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+         .ok_or(StatusCode::NOT_FOUND)?;
+        let rows = sqlx_core::query::query::<Postgres>(r#"
+          WITH RECURSIVE tree AS (
+            SELECT id FROM telegram_index_folders WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL
+            UNION ALL SELECT f.id FROM telegram_index_folders f JOIN tree t ON f.parent_id=t.id
+              WHERE f.user_id=$2 AND f.deleted_at IS NULL
+          ) SELECT id::text AS id,parent_id::text AS parent_id,name,kind,size_bytes,mime,sync_state,updated_at,source,
+            telegram_peer_id,telegram_topic_id,telegram_message_id FROM telegram_index_files
+            WHERE user_id=$2 AND deleted_at IS NULL AND parent_id IN (SELECT id FROM tree)
+            ORDER BY updated_at DESC LIMIT 5000
+        "#).bind(id).bind(user_id).fetch_all(pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        (
+            name,
+            "folder".to_string(),
+            rows.into_iter().map(row_to_item).collect(),
+        )
+    };
+    let access = Uuid::new_v4();
+    let expires = Utc::now() + chrono::Duration::hours(2);
+    sqlx_core::query::query::<Postgres>(
+        "INSERT INTO tcloud_share_access(token,share_id,expires_at) VALUES($1,$2,$3)",
+    )
+    .bind(access)
+    .bind(share_id)
+    .bind(expires)
+    .execute(pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx_core::query::query::<Postgres>(
+        "UPDATE tcloud_share_links SET download_count=download_count+1 WHERE id=$1",
+    )
+    .bind(share_id)
+    .execute(pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(PublicShareResponse {
+        name,
+        kind,
+        access_token: access.to_string(),
+        expires_at: expires.to_rfc3339(),
+        items,
+    }))
+}
+
+async fn get_public_share_media(
+    State(state): State<AppState>,
+    Path((token, id)): Path<(String, String)>,
+    Query(query): Query<PublicMediaQuery>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let pool = state.db.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "PostgreSQL indisponivel.".into(),
+    ))?;
+    let share_token =
+        Uuid::parse_str(&token).map_err(|_| (StatusCode::NOT_FOUND, "Link invalido.".into()))?;
+    let access = Uuid::parse_str(&query.access)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Acesso invalido.".into()))?;
+    let file_id =
+        Uuid::parse_str(&id).map_err(|_| (StatusCode::NOT_FOUND, "Arquivo invalido.".into()))?;
+    let row = sqlx_core::query::query::<Postgres>(r#"
+      SELECT s.user_id,s.file_id,s.folder_id FROM tcloud_share_links s JOIN tcloud_share_access a ON a.share_id=s.id
+      WHERE s.token=$1 AND a.token=$2 AND a.expires_at>NOW() AND s.revoked_at IS NULL
+    "#).bind(share_token).bind(access).fetch_optional(pool).await.map_err(|e|(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?
+      .ok_or((StatusCode::UNAUTHORIZED,"Sessao expirada.".into()))?;
+    let user_id: Uuid = row
+        .try_get("user_id")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let shared_file: Option<Uuid> = row.try_get("file_id").ok();
+    let folder: Option<Uuid> = row.try_get("folder_id").ok();
+    let allowed = if shared_file == Some(file_id) {
+        true
+    } else if let Some(folder_id) = folder {
+        sqlx_core::query_scalar::query_scalar::<Postgres,bool>(r#"
+        WITH RECURSIVE tree AS (SELECT id FROM telegram_index_folders WHERE id=$1 AND user_id=$2 UNION ALL
+        SELECT f.id FROM telegram_index_folders f JOIN tree t ON f.parent_id=t.id WHERE f.user_id=$2)
+        SELECT EXISTS(SELECT 1 FROM telegram_index_files WHERE id=$3 AND user_id=$2 AND deleted_at IS NULL AND parent_id IN(SELECT id FROM tree))
+      "#).bind(folder_id).bind(user_id).bind(file_id).fetch_one(pool).await.unwrap_or(false)
+    } else {
+        false
+    };
+    if !allowed {
+        return Err((StatusCode::NOT_FOUND, "Arquivo nao compartilhado.".into()));
+    }
+    get_media(
+        State(state),
+        Extension(security::AuthenticatedUser {
+            user_id,
+            device_id: None,
+            is_master: false,
+        }),
+        Path(id),
+        headers,
+    )
+    .await
+}
+
 async fn create_share_link(
     State(state): State<AppState>,
     Extension(auth): Extension<security::AuthenticatedUser>,
@@ -5284,13 +5459,59 @@ async fn create_share_link(
     let pool = state.db.as_ref().ok_or_else(|| {
         mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
     })?;
-    let file_id = Uuid::parse_str(&request.file_id)
+    let file_id = request
+        .file_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
         .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de arquivo invalido."))?;
-    if !owned_file_exists(pool, auth.user_id, file_id).await {
+    let mut folder_id = request
+        .folder_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| mutation_error(StatusCode::BAD_REQUEST, "ID de pasta invalido."))?;
+    if folder_id.is_none() {
+        if let Some(peer_id) = request.folder_peer_id {
+            folder_id = sqlx_core::query_scalar::query_scalar::<Postgres, Uuid>(
+                r#"
+                SELECT id FROM telegram_index_folders WHERE user_id=$1 AND telegram_peer_id=$2
+                  AND ($3::integer IS NULL OR telegram_topic_id=$3) AND deleted_at IS NULL
+                ORDER BY updated_at DESC LIMIT 1
+            "#,
+            )
+            .bind(auth.user_id)
+            .bind(peer_id)
+            .bind(request.folder_topic_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+        }
+    }
+    if file_id.is_some() == folder_id.is_some() {
         return Err(mutation_error(
-            StatusCode::NOT_FOUND,
-            "Arquivo nao encontrado.",
+            StatusCode::BAD_REQUEST,
+            "Informe um arquivo ou uma pasta.",
         ));
+    }
+    if let Some(value) = file_id {
+        if !owned_file_exists(pool, auth.user_id, value).await {
+            return Err(mutation_error(
+                StatusCode::NOT_FOUND,
+                "Arquivo nao encontrado.",
+            ));
+        }
+    }
+    if let Some(value) = folder_id {
+        let owned = sqlx_core::query_scalar::query_scalar::<Postgres, bool>(
+            "SELECT EXISTS(SELECT 1 FROM telegram_index_folders WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL)"
+        ).bind(value).bind(auth.user_id).fetch_one(pool).await.unwrap_or(false);
+        if !owned {
+            return Err(mutation_error(
+                StatusCode::NOT_FOUND,
+                "Pasta nao encontrada.",
+            ));
+        }
     }
     let id = Uuid::new_v4();
     let token = Uuid::new_v4();
@@ -5311,11 +5532,11 @@ async fn create_share_link(
         .filter(|v| *v > 0)
         .map(|hours| Utc::now() + chrono::Duration::hours(hours.min(24 * 365)));
     let max_downloads = request.max_downloads.filter(|v| *v > 0);
-    sqlx_core::query::query::<Postgres>("INSERT INTO tcloud_share_links(id,user_id,file_id,token,password_hash,expires_at,max_downloads) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(auth.user_id).bind(file_id).bind(token).bind(password_hash).bind(expires_at).bind(max_downloads).execute(pool).await.map_err(|error|mutation_error(StatusCode::BAD_REQUEST,error.to_string()))?;
+    sqlx_core::query::query::<Postgres>("INSERT INTO tcloud_share_links(id,user_id,file_id,folder_id,token,password_hash,expires_at,max_downloads) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(id).bind(auth.user_id).bind(file_id).bind(folder_id).bind(token).bind(password_hash).bind(expires_at).bind(max_downloads).execute(pool).await.map_err(|error|mutation_error(StatusCode::BAD_REQUEST,error.to_string()))?;
     record_activity(
         pool,
         auth.user_id,
-        Some(file_id),
+        file_id,
         "share.create",
         Some(&id.to_string()),
     )
@@ -5323,7 +5544,13 @@ async fn create_share_link(
     Ok(Json(ShareLinkResponse {
         id: id.to_string(),
         token: token.to_string(),
-        path: format!("/share/{}", token),
+        path: format!(
+            "{}/share/{}",
+            env::var("TCLOUD_WEB_URL")
+                .unwrap_or_else(|_| "https://web-seven-ivory-34.vercel.app".to_string())
+                .trim_end_matches('/'),
+            token
+        ),
         expires_at: expires_at.map(|v| v.to_rfc3339()),
         max_downloads,
     }))
