@@ -196,6 +196,9 @@ struct DeviceSummary {
     platform: String,
     app_version: Option<String>,
     last_seen_at: Option<String>,
+    created_at: String,
+    active: bool,
+    current: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +265,7 @@ struct RevokeDeviceRequest {
 struct UpdateProfileRequest {
     display_name: String,
     username: String,
+    avatar_data_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +276,7 @@ struct UserProfileResponse {
     username: Option<String>,
     avatar_url: Option<String>,
     profile_complete: bool,
+    verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -5615,6 +5620,8 @@ async fn list_devices(
             platform,
             app_version,
             last_seen_at
+            ,created_at,
+            EXISTS(SELECT 1 FROM sessions s WHERE s.device_id=devices.id AND s.revoked_at IS NULL AND s.expires_at>NOW()) AS active
         FROM devices
         WHERE user_id = $1
         ORDER BY last_seen_at DESC NULLS LAST, name
@@ -5644,6 +5651,13 @@ async fn list_devices(
                 platform: row.try_get("platform").unwrap_or_default(),
                 app_version: row.try_get("app_version").ok(),
                 last_seen_at: last_seen,
+                created_at: row
+                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default(),
+                active: row.try_get("active").unwrap_or(false),
+                current: auth.device_id.map(|value| value.to_string())
+                    == row.try_get::<String, _>("id").ok(),
             }
         })
         .collect();
@@ -5684,10 +5698,19 @@ fn clean_profile_name(value: &str) -> Result<String, (StatusCode, Json<MutationR
 fn clean_username(value: &str) -> Result<String, (StatusCode, Json<MutationResponse>)> {
     let cleaned = value.trim().trim_start_matches('@').to_ascii_lowercase();
     if cleaned.len() < 3 || cleaned.len() > 32 {
-        return Err(mutation_error(StatusCode::BAD_REQUEST, "O nome de usuario deve ter entre 3 e 32 caracteres."));
+        return Err(mutation_error(
+            StatusCode::BAD_REQUEST,
+            "O nome de usuario deve ter entre 3 e 32 caracteres.",
+        ));
     }
-    if !cleaned.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
-        return Err(mutation_error(StatusCode::BAD_REQUEST, "Use apenas letras, numeros e sublinhado no nome de usuario."));
+    if !cleaned
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(mutation_error(
+            StatusCode::BAD_REQUEST,
+            "Use apenas letras, numeros e sublinhado no nome de usuario.",
+        ));
     }
     Ok(cleaned)
 }
@@ -5696,19 +5719,31 @@ async fn get_profile(
     State(state): State<AppState>,
     Extension(auth): Extension<security::AuthenticatedUser>,
 ) -> Result<Json<UserProfileResponse>, (StatusCode, Json<MutationResponse>)> {
-    let pool = state.db.as_ref().ok_or_else(|| mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel."))?;
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
     let row = sqlx_core::query::query::<Postgres>(
-        "SELECT id::text AS id,display_name,username,avatar_url FROM users WHERE id=$1"
+        "SELECT id::text AS id,display_name,username,avatar_url,telegram_user_id FROM users WHERE id=$1"
     ).bind(auth.user_id).fetch_one(pool).await
         .map_err(|error| mutation_error(StatusCode::NOT_FOUND, error.to_string()))?;
-    let username = row.try_get::<Option<String>, _>("username").unwrap_or(None).filter(|value| !value.trim().is_empty());
+    let username = row
+        .try_get::<Option<String>, _>("username")
+        .unwrap_or(None)
+        .filter(|value| !value.trim().is_empty());
     let display_name = row.try_get::<String, _>("display_name").unwrap_or_default();
     Ok(Json(UserProfileResponse {
         id: row.try_get("id").unwrap_or_default(),
-        profile_complete: username.is_some() && display_name.trim() != "Nova conta" && display_name.trim().len() >= 2,
+        profile_complete: username.is_some()
+            && display_name.trim() != "Nova conta"
+            && display_name.trim().len() >= 2,
         display_name,
         username,
         avatar_url: row.try_get("avatar_url").ok(),
+        verified: row
+            .try_get::<Option<i64>, _>("telegram_user_id")
+            .ok()
+            .flatten()
+            .is_some(),
     }))
 }
 
@@ -5717,24 +5752,56 @@ async fn update_profile(
     Extension(auth): Extension<security::AuthenticatedUser>,
     Json(request): Json<UpdateProfileRequest>,
 ) -> Result<Json<UserProfileResponse>, (StatusCode, Json<MutationResponse>)> {
-    let pool = state.db.as_ref().ok_or_else(|| mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel."))?;
+    let pool = state.db.as_ref().ok_or_else(|| {
+        mutation_error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL indisponivel.")
+    })?;
     let display_name = clean_profile_name(&request.display_name)?;
     let username = clean_username(&request.username)?;
-    let result = sqlx_core::query::query::<Postgres>(
-        "UPDATE users SET display_name=$1,username=$2,updated_at=NOW() WHERE id=$3"
-    ).bind(&display_name).bind(&username).bind(auth.user_id).execute(pool).await;
-    if let Err(error) = result {
-        if error.to_string().to_ascii_lowercase().contains("unique") {
-            return Err(mutation_error(StatusCode::CONFLICT, "Este nome de usuario ja esta em uso."));
+    let avatar_url = request
+        .avatar_data_url
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = avatar_url {
+        let valid_prefix = value.starts_with("data:image/png;base64,")
+            || value.starts_with("data:image/jpeg;base64,")
+            || value.starts_with("data:image/webp;base64,");
+        if !valid_prefix || value.len() > 700_000 {
+            return Err(mutation_error(
+                StatusCode::BAD_REQUEST,
+                "Use uma imagem PNG, JPEG ou WebP de ate 500 KB.",
+            ));
         }
-        return Err(mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
+    let result = sqlx_core::query::query::<Postgres>(
+        "UPDATE users SET display_name=$1,username=$2,avatar_url=COALESCE($3,avatar_url),updated_at=NOW() WHERE id=$4 RETURNING telegram_user_id,avatar_url"
+    ).bind(&display_name).bind(&username).bind(avatar_url).bind(auth.user_id).fetch_one(pool).await;
+    let row = match result {
+        Ok(row) => row,
+        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+            return Err(mutation_error(
+                StatusCode::CONFLICT,
+                "Este nome de usuario ja esta em uso.",
+            ));
+        }
+        Err(error) => {
+            return Err(mutation_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            ));
+        }
+    };
     Ok(Json(UserProfileResponse {
         id: auth.user_id.to_string(),
         display_name,
         username: Some(username),
-        avatar_url: None,
+        avatar_url: row.try_get("avatar_url").ok(),
         profile_complete: true,
+        verified: row
+            .try_get::<Option<i64>, _>("telegram_user_id")
+            .ok()
+            .flatten()
+            .is_some(),
     }))
 }
 
@@ -5768,8 +5835,16 @@ async fn register_account(
         .await
         .map_err(|error| mutation_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let display_name = request.display_name.as_deref().map(clean_profile_name).transpose()?;
-    let username = request.username.as_deref().map(clean_username).transpose()?;
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(clean_profile_name)
+        .transpose()?;
+    let username = request
+        .username
+        .as_deref()
+        .map(clean_username)
+        .transpose()?;
     sqlx_core::query::query::<Postgres>(
         "INSERT INTO users(id,display_name,username) VALUES($1,$2,$3)",
     )

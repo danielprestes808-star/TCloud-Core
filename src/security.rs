@@ -124,9 +124,14 @@ impl SecurityState {
         .fetch_optional(pool)
         .await;
         let row = valid.ok().flatten()?;
+        let device_id = row.try_get::<Option<Uuid>, _>("device_id").ok().flatten();
+        if let Some(device_id) = device_id {
+            let _ = query("UPDATE devices SET last_seen_at=NOW(),updated_at=NOW() WHERE id=$1 AND (last_seen_at IS NULL OR last_seen_at<NOW()-INTERVAL '1 minute')")
+                .bind(device_id).execute(pool).await;
+        }
         Some(AuthenticatedUser {
             user_id: row.try_get("user_id").ok()?,
-            device_id: row.try_get::<Option<Uuid>, _>("device_id").ok().flatten(),
+            device_id,
             is_master: false,
         })
     }
